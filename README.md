@@ -2,7 +2,7 @@
 
 **Minecraft 1.21.x  |  Fabric  |  Requires Serene Seasons**
 
-Season Cache keeps snow and ice blocks in sync with your Serene Seasons configuration. When winter arrives, snow and ice appear on terrain. When spring comes, they clear. It also builds and maintains a server-authoritative per-chunk snow coverage map that companion mods such as Nova Reimagined Snow can use to drive accurate shader snow in Distant Horizons LOD terrain.
+Season Cache keeps snow and ice blocks in sync with your Serene Seasons configuration. When winter arrives, snow and ice appear on terrain. When spring comes, they clear. It also builds and maintains a server-authoritative per-chunk snow coverage map that companion mods such as Nova Reimagined Snow can use to drive accurate shader snow in Distant Horizons LOD terrain via Nova Reimagined shader pack.
 
 ---
 
@@ -10,7 +10,7 @@ Season Cache keeps snow and ice blocks in sync with your Serene Seasons configur
 
 Without this mod, Serene Seasons changes the season but the world only gains or loses snow through Minecraft's slow random tick system. That process takes in-game days to visibly change large areas. Season Cache reconciles the entire loaded world immediately when a season transition occurs.
 
-It also solves the LOD snow problem. Distant Horizons renders terrain far beyond vanilla render distance using its own geometry. Without accurate per-chunk snow data, shaders have no way to know which distant chunks should show snow. Season Cache builds a complete coverage map of the entire explored world and streams it to connected clients so shader packs can use it.
+It also solves the LOD snow problem when used with the Nova Reimagined shader pack. Distant Horizons renders terrain far beyond vanilla render distance using its own geometry. Without accurate per-chunk snow data, shaders have no way to know which distant chunks should show snow. Season Cache builds a complete coverage map of the entire explored world and streams it to connected clients so Nova Reimagined can use it.
 
 ---
 
@@ -37,7 +37,7 @@ Optional but recommended:
 3. Place `seasoncache-<version>.jar` in your `mods` folder
 4. Start the server or singleplayer world
 
-Season Cache works on both dedicated servers and singleplayer. On a dedicated server, install it server-side only. The client-side component handles shader integration when Nova Reimagined Snow is also installed on the client.
+Season Cache works on both dedicated servers and singleplayer. On a dedicated server, install it server-side only. The client-side component handles shader integration when Nova Reimagined Snow is also installed on the client so install it client side when appropriate.
 
 ---
 
@@ -74,33 +74,23 @@ Controls how many chunks are reconciled per server tick. Higher values clear ter
 
 All commands require operator level 2.
 
-`/seasoncache status` — shows current season, cleanup mode, queue size, coverage build progress, and cache statistics.
+`/seasoncache status` â€” shows current season, cleanup mode, queue size, coverage build progress, and cache statistics.
 
-`/seasoncache mode aggressive` — switch to aggressive mode at runtime.
+`/seasoncache mode aggressive` â€” switch to aggressive mode at runtime.
 
-`/seasoncache mode conservative` — switch to conservative mode at runtime.
+`/seasoncache mode conservative` â€” switch to conservative mode at runtime.
 
-`/seasoncache invalidate all` — clears all stored epoch data and triggers a full rebuild. Use after making significant terrain changes or if coverage data looks wrong.
+`/seasoncache invalidate all` â€” clears all stored epoch data and triggers a full rebuild. Use after making significant terrain changes or if coverage data looks wrong.
 
-`/seasoncache debug <radius>` — shows temperature data for chunks around your position. Useful for diagnosing unexpected snow or no-snow areas.
-
----
-
-## How the coverage map works
-
-On server start, Season Cache reads heightmap data from Anvil region files for the entire explored world without invoking the chunk generator. It samples the biome and Serene Seasons temperature at the surface of each chunk and classifies it as snowy or not for the current season. This produces a complete per-chunk coverage map stored in sidecar files alongside your world data.
-
-When a player connects, the server sends the full coverage map as a snapshot sorted by distance from the player. As the world changes (season transitions, chunk loads), incremental updates are streamed to clients. Nova Reimagined Snow receives these updates and writes them to a GPU texture that the shader samples when rendering both vanilla and LOD terrain.
-
-The sidecar files mean subsequent server starts are fast. Rather than re-deriving coverage from scratch, Season Cache pre-warms from the existing files in seconds and only re-derives chunks where the season has changed.
+`/seasoncache debug <radius>` â€” shows temperature data for chunks around your position. Useful for diagnosing unexpected snow or no-snow areas.
 
 ---
 
 ## Performance notes
 
-The initial coverage build after a fresh install or cache wipe reads region files from disk rather than running the world generator, so it typically completes in under two minutes for a fully explored world. The server tick thread is not blocked during this process.
+The initial coverage build after a fresh install or cache wipe reads region files from disk rather than running the world generator, but it will typically still take some time depending on the size of the world already generated. The server tick thread is not blocked during this process. My 25,000 block diameter world takes about an hour or so on my server.
 
-Snow and ice reconciliation during season transitions uses a section-level block scan that skips chunk sections containing neither snow nor ice, making it fast enough to keep up with elytra flight at default budget settings.
+Snow and ice reconciliation during season transitions uses a section-level block scan that skips chunk sections containing neither snow nor ice, making it fast enough to keep up with elytra flight at default budget settings....hopefully haha.
 
 ---
 
@@ -120,9 +110,3 @@ Snow and ice reconciliation during season transitions uses a section-level block
 ## License
 
 MIT. See LICENSE for full terms.
-
----
-
-## Credits
-
-**ItsThatNova** - mod author
