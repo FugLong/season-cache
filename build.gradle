@@ -1,0 +1,76 @@
+plugins {
+    id "fabric-loom" version "1.7-SNAPSHOT"
+    id "java"
+    id "com.modrinth.minotaur" version "2.+"
+}
+
+version = project.mod_version
+group = project.maven_group
+
+base {
+    archivesName = project.archives_base_name
+}
+
+repositories {
+    maven { url "https://api.modrinth.com/maven" }
+}
+
+dependencies {
+    minecraft "com.mojang:minecraft:${project.minecraft_version}"
+    mappings "net.fabricmc:yarn:${project.yarn_mappings}:v2"
+    modImplementation "net.fabricmc:fabric-loader:${project.loader_version}"
+    modImplementation "net.fabricmc.fabric-api:fabric-api:${project.fabric_version}"
+
+    // Serene Seasons — compile-time only, not bundled.
+    // Place the SS jar for your target MC version in the libs/ directory.
+    // Required at runtime — enforced via the "depends" entry in fabric.mod.json.
+    // Minimum version: 10.1.0.1 for MC 1.21.1.
+    modCompileOnly fileTree(dir: 'libs', include: '*.jar')
+}
+
+processResources {
+    inputs.property "version", project.version
+    filesMatching("fabric.mod.json") {
+        expand "version": project.version
+    }
+}
+
+tasks.withType(JavaCompile).configureEach {
+    it.options.release = project.java_version as Integer
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(project.java_version as Integer)
+    }
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+    withSourcesJar()
+}
+
+jar {
+    from("LICENSE") {
+        rename { "${it}_${project.archives_base_name}" }
+    }
+}
+
+// Modrinth publishing
+// Set MODRINTH_TOKEN in your environment before running ./gradlew modrinth
+modrinth {
+    token = System.getenv("MODRINTH_TOKEN")
+    projectId = "seasoncache"
+    versionNumber = project.mod_version
+    versionName = "Season Cache ${project.mod_version}"
+    versionType = "release"
+    uploadFile = remapJar
+    additionalFiles = [sourcesJar]
+    gameVersions = ["1.21.1"]
+    loaders = ["fabric"]
+    changelog = file("PATCH_NOTES.txt").text
+    dependencies {
+        // Serene Seasons — required
+        required.project "serene-seasons"
+        // Fabric API — required
+        required.project "fabric-api"
+    }
+}

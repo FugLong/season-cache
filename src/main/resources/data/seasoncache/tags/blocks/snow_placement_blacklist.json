@@ -1,0 +1,47 @@
+{
+  "replace": false,
+  "values": [
+    "#minecraft:shulker_boxes",
+
+    "minecraft:crafting_table",
+
+    "minecraft:chest",
+    "minecraft:trapped_chest",
+    "minecraft:ender_chest",
+    "minecraft:barrel",
+
+    "minecraft:furnace",
+    "minecraft:blast_furnace",
+    "minecraft:smoker",
+
+    "minecraft:enchanting_table",
+
+    "minecraft:anvil",
+    "minecraft:chipped_anvil",
+    "minecraft:damaged_anvil",
+
+    "minecraft:bookshelf",
+    "minecraft:chiseled_bookshelf",
+
+    "minecraft:cartography_table",
+    "minecraft:fletching_table",
+    "minecraft:smithing_table",
+    "minecraft:loom",
+    "minecraft:grindstone",
+
+    "minecraft:jukebox",
+    "minecraft:note_block",
+
+    "minecraft:dispenser",
+    "minecraft:dropper",
+    "minecraft:observer",
+
+    "minecraft:beacon",
+
+    "minecraft:command_block",
+    "minecraft:chain_command_block",
+    "minecraft:repeating_command_block",
+    "minecraft:structure_block",
+    "minecraft:jigsaw"
+  ]
+}

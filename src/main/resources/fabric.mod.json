@@ -1,0 +1,32 @@
+{
+  "schemaVersion": 1,
+  "id": "seasoncache",
+  "version": "${version}",
+  "name": "Season Cache",
+  "description": "Keeps snow and ice in sync with Serene Seasons. Removes snow in spring, places it in winter, and drives LOD shader snow coverage for Nova Reimagined and Distant Horizons.",
+  "authors": [
+    "ItsThatNova"
+  ],
+  "contact": {
+    "homepage": "https://modrinth.com/mod/seasoncache",
+    "sources": "https://github.com/ItsThatNova/season-cache",
+    "issues": "https://github.com/ItsThatNova/season-cache/issues"
+  },
+  "license": "MIT",
+  "icon": "assets/seasoncache/icon.png",
+  "environment": "*",
+  "entrypoints": {
+    "main": [
+      "com.seasoncache.SeasonCacheMod"
+    ],
+    "client": [
+      "com.seasoncache.client.SeasonCacheClient"
+    ]
+  },
+  "depends": {
+    "fabricloader": ">=0.16.0",
+    "minecraft": ">=1.21 <=1.21.99",
+    "fabric-api": "*",
+    "sereneseasons": "*"
+  }
+}
