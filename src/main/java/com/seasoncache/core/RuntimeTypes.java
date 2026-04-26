@@ -47,13 +47,28 @@ public final class RuntimeTypes {
     public record SeasonSnapshot(String providerId, String seasonKey) {
     }
 
-    public record CoverageSeasonSnapshot() {
-    }
-
-    public record CoverageSample(boolean snowy) {
-    }
-
     public record StaticChunkClimate(String biomeId, int surfaceY) {
     }
 
+    public record ChunkSeasonRule(int snowEpochMask, boolean perennialNoTouch) {
+        public boolean isSnowyInSeason(int seasonIndex) {
+            if (seasonIndex < 0 || seasonIndex >= 12) return false;
+            return (this.snowEpochMask & (1 << seasonIndex)) != 0;
+        }
+    }
+
+    public record SeasonRuleConfig(
+            boolean generateSnowIce,
+            java.util.Map<String, Float> adjustmentsBySeasonKey,
+            java.util.List<String> orderedSeasonKeys,
+            String hash,
+            java.nio.file.Path sourcePath
+    ) {
+        public int seasonIndex(String seasonKey) {
+            if (seasonKey == null) return -1;
+            return this.orderedSeasonKeys.indexOf(seasonKey);
+        }
+    }
+
 }
+

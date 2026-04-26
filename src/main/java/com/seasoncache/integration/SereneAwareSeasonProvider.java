@@ -14,7 +14,6 @@ import sereneseasons.season.SeasonHooks;
 import java.util.Collections;
 import java.util.HashSet;
 import java.util.Set;
-import java.util.Set;
 
 /**
  * SeasonProvider implementation backed directly by the Serene Seasons API.
@@ -144,39 +143,9 @@ public final class SereneAwareSeasonProvider implements SeasonProvider {
     }
 
     @Override
-    public RuntimeTypes.CoverageSeasonSnapshot snapshotCoverageSeason(ServerWorld world) {
-        return new RuntimeTypes.CoverageSeasonSnapshot();
-    }
-
-    /**
-     * Coarse unloaded-chunk snow coverage sample.
-     *
-     * Uses SeasonHooks.getBiomeTemperature — the same seasonally-adjusted temperature
-     * oracle the reconciler uses in shouldHaveSnowNow — rather than
-     * getPrecipitationAtSeasonal. The two SS methods diverge: getPrecipitationAtSeasonal
-     * can return non-SNOW for biomes (snowy slopes, jagged peaks, frozen rivers) that
-     * getBiomeTemperature correctly places well below the 0.15f threshold. Using the
-     * temperature path ensures the coverage builder's coarse decision agrees with the
-     * reconciler's per-column decision, preventing LOD shader "flushes" where the
-     * coverage path incorrectly clears biomes that the reconciler correctly marks snowy.
-     *
-     * Non-precipitating biomes (deserts, badlands) are excluded first — they cannot
-     * receive snow regardless of temperature.
-     */
-    @Override
-    public RuntimeTypes.CoverageSample snapshotCoverageSample(ServerWorld world, BlockPos pos,
+    public float sampleSeasonalTemperature(ServerWorld world, BlockPos pos,
             RegistryEntry<Biome> biomeEntry) {
-        if (!biomeEntry.value().hasPrecipitation()) {
-            return new RuntimeTypes.CoverageSample(false);
-        }
-        float adjustedTemp = SeasonHooks.getBiomeTemperature(world, biomeEntry, pos);
-        return new RuntimeTypes.CoverageSample(adjustedTemp < PERENNIAL_COLD_THRESHOLD);
-    }
-
-    @Override
-    public boolean shouldSampleSnowCoverage(RuntimeTypes.CoverageSeasonSnapshot seasonSnapshot,
-            RuntimeTypes.CoverageSample sample) {
-        return sample.snowy();
+        return SeasonHooks.getBiomeTemperature(world, biomeEntry, pos);
     }
 
     /**

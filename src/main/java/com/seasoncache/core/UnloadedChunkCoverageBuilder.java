@@ -33,29 +33,12 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Derives coarse unloaded-chunk seasonal snow coverage from per-chunk static climate
- * samples (biomeId + surfaceY) stored in Season Cache sidecars.
+ * Background rule pre-builder for unloaded terrain.
  *
- * Each region is categorised into one of three paths on every {@link #start} call:
- *
- *  PRE-WARM (same epoch, static data complete):
- *    Coverage on disk is already current for this season. The sidecar is submitted for
- *    background loading into the store so the initial snapshot has complete data when
- *    the player arrives. No SS queries, no coverage deltas, no tick-thread budget.
- *
- *  RE-DERIVE (epoch changed, static data complete):
- *    The season changed since the last run. Coverage is re-computed from the cached
- *    static climate samples using a single SS call per chunk. No heightmap reads.
- *    Coverage deltas are emitted for Nova via onChunkCoverageComputed.
- *
- *  FULL SCAN (static data missing or incomplete):
- *    New or partially-analysed terrain. Surface heights are read from the .mca
- *    heightmap, biomes sampled from the world, static samples persisted to the
- *    sidecar for future runs, then coverage derived as in the re-derive path.
- *
- * This means that after the first complete world analysis pass, subsequent server
- * restarts in the same season cost only sidecar loads (IO-thread only, zero SS calls),
- * while season transitions cost one SS call per unloaded chunk with no disk reads.
+ * This pass is no longer a current-epoch coverage builder. It only ensures that
+ * persistent static samples and persistent 12-season chunk rules exist for explored
+ * chunks found in region files. Live chunk snow booleans are derived from the rule
+ * whenever clients or the runtime need them.
  */
 public final class UnloadedChunkCoverageBuilder {
     private static final Gson GSON = new Gson();
@@ -74,19 +57,17 @@ public final class UnloadedChunkCoverageBuilder {
     private final AtomicInteger inflightRegions = new AtomicInteger(0);
 
     private volatile boolean shutdownRequested = false;
+    private volatile int generation = 0;
 
     private RegionBatch currentBatch = null;
     private int currentBatchIndex = 0;
 
     private RuntimeTypes.BudgetProfile activeProfile = RuntimeTypes.BudgetProfile.LOW;
     private boolean active = false;
-    private int targetEpoch = 0;
     private int totalFiles = 0;
     private int processedFiles = 0;
-    private int preWarmCount = 0;
-    private int reDeriveCount = 0;
+    private int staticOnlyCount = 0;
     private int fullScanCount = 0;
-    private RuntimeTypes.CoverageSeasonSnapshot activeSeasonSnapshot;
 
     public UnloadedChunkCoverageBuilder(
             SeasonCacheConfig config,
@@ -107,21 +88,6 @@ public final class UnloadedChunkCoverageBuilder {
     public int processedFiles() { return this.processedFiles; }
     public RuntimeTypes.BudgetProfile activeProfile() { return this.activeProfile; }
 
-    /**
-     * Re-sorts the pending region queue nearest-first from the given player chunk
-     * position. Called once at player join / overworld re-entry while a build is
-     * still in progress. Has no effect if the queue has already been drained.
-     *
-     * The sort is on the pending Path deque only — IO tasks already submitted to
-     * the IO thread are unaffected, but on a cold start the full drain happens on
-     * the first tick after server start so the player join typically fires before
-     * any regions have been submitted. On a warm restart the queue is empty
-     * (pre-warm tasks go directly to the IO thread) so the sort is a no-op.
-     *
-     * Region coordinates are extracted from the filename (r.X.Z.mca) so no disk
-     * access is required. The player's region coordinate is derived from their
-     * chunk position, one region = 32 chunks.
-     */
     public void prioritizeFromPlayer(ChunkPos playerChunk) {
         if (this.pendingRegions.isEmpty()) return;
 
@@ -129,18 +95,13 @@ public final class UnloadedChunkCoverageBuilder {
         int playerRegionZ = Math.floorDiv(playerChunk.z, 32);
 
         List<Path> sorted = new ArrayList<>(this.pendingRegions);
-        sorted.sort((a, b) -> {
-            long da = regionDistanceSq(a.getFileName().toString(), playerRegionX, playerRegionZ);
-            long db = regionDistanceSq(b.getFileName().toString(), playerRegionX, playerRegionZ);
-            return Long.compare(da, db);
-        });
+        sorted.sort((a, b) -> Long.compare(
+                regionDistanceSq(a.getFileName().toString(), playerRegionX, playerRegionZ),
+                regionDistanceSq(b.getFileName().toString(), playerRegionX, playerRegionZ)
+        ));
 
         this.pendingRegions.clear();
         this.pendingRegions.addAll(sorted);
-
-        SeasonCacheMod.LOGGER.info(
-                "Season Cache: re-sorted {} pending regions nearest-first from player region [{}, {}].",
-                sorted.size(), playerRegionX, playerRegionZ);
     }
 
     private static long regionDistanceSq(String filename, int playerRegionX, int playerRegionZ) {
@@ -152,18 +113,18 @@ public final class UnloadedChunkCoverageBuilder {
     }
 
     public void start(ServerWorld world, RuntimeTypes.BudgetProfile profile) {
+        this.generation++;
+        this.shutdownRequested = false;
         this.pendingRegions.clear();
         this.completedBatches.clear();
+        this.inflightRegions.set(0);
         this.currentBatch = null;
         this.currentBatchIndex = 0;
         this.processedFiles = 0;
         this.totalFiles = 0;
-        this.preWarmCount = 0;
-        this.reDeriveCount = 0;
+        this.staticOnlyCount = 0;
         this.fullScanCount = 0;
         this.activeProfile = profile;
-        this.targetEpoch = this.epochService.currentEpoch(world);
-        this.activeSeasonSnapshot = this.provider.snapshotCoverageSeason(world);
 
         Path regionDir = getRegionDirectory(world);
         if (!Files.isDirectory(regionDir)) {
@@ -172,25 +133,23 @@ public final class UnloadedChunkCoverageBuilder {
         }
 
         try {
-            // Sort by distance from world spawn as a reasonable default — the player
-            // will almost always join near spawn. prioritizeFromPlayer() can re-sort
-            // whatever hasn't been submitted yet once the actual login origin is known.
             ChunkPos spawnChunk = new ChunkPos(world.getSpawnPos());
             int spawnRegionX = Math.floorDiv(spawnChunk.x, 32);
             int spawnRegionZ = Math.floorDiv(spawnChunk.z, 32);
 
             List<Path> files = Files.list(regionDir)
                     .filter(Files::isRegularFile)
-                    .filter(p -> REGION_NAME.matcher(p.getFileName().toString()).matches())
-                    .sorted(Comparator.comparingLong(p ->
-                            regionDistanceSq(p.getFileName().toString(), spawnRegionX, spawnRegionZ)))
+                    .filter(path -> REGION_NAME.matcher(path.getFileName().toString()).matches())
+                    .sorted(Comparator.comparingLong(path ->
+                            regionDistanceSq(path.getFileName().toString(), spawnRegionX, spawnRegionZ)))
                     .toList();
+
             this.pendingRegions.addAll(files);
             this.totalFiles = files.size();
             this.active = !files.isEmpty();
         } catch (Exception e) {
             this.active = false;
-            SeasonCacheMod.LOGGER.warn("Season Cache: failed to enumerate region files for unloaded coverage build.", e);
+            SeasonCacheMod.LOGGER.warn("Season Cache: failed to enumerate region files for rule prebuild.", e);
         }
     }
 
@@ -201,12 +160,6 @@ public final class UnloadedChunkCoverageBuilder {
     public void tick(ServerWorld world) {
         if (!this.active) return;
 
-        int currentEpoch = this.epochService.currentEpoch(world);
-        if (currentEpoch != this.targetEpoch) {
-            start(world, this.activeProfile);
-            return;
-        }
-
         RuntimeTypes.Budget budget = this.config.budgetFor(this.activeProfile);
         long startNs = System.nanoTime();
         long maxMillis = Math.max(5L, budget.maxMillisPerTick());
@@ -214,10 +167,6 @@ public final class UnloadedChunkCoverageBuilder {
         if (!this.pendingRegions.isEmpty()) {
             int bottomY = world.getBottomY();
             int worldHeight = world.getHeight();
-            // Submit at most regionsPerTick regions per tick so pendingRegions is
-            // not fully drained on the first tick. This keeps unsubmitted regions
-            // available for prioritizeFromPlayer() to re-sort when a player joins,
-            // ensuring the remaining IO submissions proceed in player-distance order.
             int submissionsThisTick = 0;
             int maxSubmissions = budget.regionsPerTick();
             while (!this.pendingRegions.isEmpty() && submissionsThisTick < maxSubmissions) {
@@ -234,11 +183,10 @@ public final class UnloadedChunkCoverageBuilder {
                 this.currentBatchIndex = 0;
             }
 
-            this.currentBatchIndex = drainBatch(world, this.currentBatch, this.currentBatchIndex, currentEpoch, startNs, maxMillis);
+            this.currentBatchIndex = drainBatch(world, this.currentBatch, this.currentBatchIndex, startNs, maxMillis);
             if (this.currentBatchIndex >= this.currentBatch.entries().size()) {
                 switch (this.currentBatch.path()) {
-                    case PRE_WARM  -> this.preWarmCount++;
-                    case RE_DERIVE -> this.reDeriveCount++;
+                    case STATIC_ONLY -> this.staticOnlyCount++;
                     case FULL_SCAN -> this.fullScanCount++;
                 }
                 this.currentBatch = null;
@@ -254,10 +202,8 @@ public final class UnloadedChunkCoverageBuilder {
             this.active = false;
             this.store.flushDirty();
             SeasonCacheMod.LOGGER.info(
-                    "Season Cache: coverage pass complete for epoch {} — {} regions total " +
-                    "({} pre-warmed, {} re-derived, {} full-scanned).",
-                    this.targetEpoch, this.totalFiles,
-                    this.preWarmCount, this.reDeriveCount, this.fullScanCount);
+                    "Season Cache: rule prebuild complete — {} regions total ({} static-only, {} full-scanned).",
+                    this.totalFiles, this.staticOnlyCount, this.fullScanCount);
         }
     }
 
@@ -269,32 +215,23 @@ public final class UnloadedChunkCoverageBuilder {
         int regionZ = Integer.parseInt(matcher.group(2));
         Path sidecarPath = sidecarPath(world, regionX, regionZ);
 
+        final int runGeneration = this.generation;
         this.inflightRegions.incrementAndGet();
         this.ioThread.submitHeightmapRead(() -> {
             RegionBatch batch;
             try {
                 if (this.shutdownRequested) {
-                    batch = new RegionBatch(List.of(), RegionPath.PRE_WARM);
+                    batch = new RegionBatch(List.of(), RegionPath.STATIC_ONLY, regionX, regionZ, 0);
                 } else {
                     StaticRegionSnapshot staticSnapshot = readStaticSnapshot(sidecarPath);
-                    boolean staticComplete = !staticSnapshot.entries().isEmpty()
-                            && (staticSnapshot.knownChunkCount() <= 0
-                                    || staticSnapshot.entries().size() >= staticSnapshot.knownChunkCount());
-                    boolean sameEpoch = staticSnapshot.dataEpoch() == this.targetEpoch;
+                    boolean staticComplete = staticSnapshot.knownChunkCount() > 0
+                            && !staticSnapshot.entries().isEmpty()
+                            && staticSnapshot.entries().size() >= staticSnapshot.knownChunkCount();
 
-                    if (sameEpoch && staticComplete) {
-                        // PRE-WARM: coverage is already current on disk. Trigger a background
-                        // sidecar load so the snapshot has complete data at player login.
-                        // No SS queries, no coverage deltas — nothing to process on the tick thread.
-                        this.store.preWarmRegion(world, regionX, regionZ);
-                        batch = new RegionBatch(List.of(), RegionPath.PRE_WARM);
-                    } else if (staticComplete) {
-                        // RE-DERIVE: epoch changed, but static geography is fully cached.
-                        // Re-classify each chunk with one SS call — no heightmap reads needed.
-                        batch = new RegionBatch(new ArrayList<>(staticSnapshot.entries().values()), RegionPath.RE_DERIVE);
+                    if (staticComplete) {
+                        batch = new RegionBatch(new ArrayList<>(staticSnapshot.entries().values()),
+                                RegionPath.STATIC_ONLY, regionX, regionZ, staticSnapshot.knownChunkCount());
                     } else {
-                        // FULL SCAN: static samples missing or incomplete for this region.
-                        // Read surface heights from the .mca file then merge with any partial cache.
                         List<RegionHeightmapReader.ChunkSurfaceEntry> heights = RegionHeightmapReader.readSurfaceHeights(
                                 regionPath, regionX, regionZ, bottomY, worldHeight);
                         List<ChunkClimateWorkEntry> merged = new ArrayList<>(heights.size());
@@ -306,29 +243,34 @@ public final class UnloadedChunkCoverageBuilder {
                                 merged.add(new ChunkClimateWorkEntry(heightEntry.chunkPos(), heightEntry.surfaceY(), null));
                             }
                         }
-                        batch = new RegionBatch(merged, RegionPath.FULL_SCAN);
+                        batch = new RegionBatch(merged, RegionPath.FULL_SCAN, regionX, regionZ, heights.size());
                     }
                 }
             } catch (Exception e) {
-                SeasonCacheMod.LOGGER.warn("Season Cache: unloaded coverage batch failed for {}.", regionPath.getFileName(), e);
-                batch = new RegionBatch(List.of(), RegionPath.FULL_SCAN);
+                SeasonCacheMod.LOGGER.warn("Season Cache: unloaded rule prebuild batch failed for {}.", regionPath.getFileName(), e);
+                batch = new RegionBatch(List.of(), RegionPath.FULL_SCAN, regionX, regionZ, 0);
             }
 
-            this.completedBatches.offer(batch);
+            if (this.generation == runGeneration) {
+                this.completedBatches.offer(batch);
+            }
             this.inflightRegions.decrementAndGet();
         });
     }
 
-    private int drainBatch(ServerWorld world, RegionBatch batch, int fromIndex, int currentEpoch, long startNs, long maxMillis) {
+    private int drainBatch(ServerWorld world, RegionBatch batch, int fromIndex, long startNs, long maxMillis) {
         int i = fromIndex;
+        if (batch.knownChunkCount() > 0) {
+            this.store.setKnownChunkCount(world, batch.regionX(), batch.regionZ(), batch.knownChunkCount());
+        }
         while (i < batch.entries().size() && elapsedMillis(startNs) < maxMillis) {
-            processEntry(world, batch.entries().get(i), currentEpoch);
+            processEntry(world, batch.entries().get(i));
             i++;
         }
         return i;
     }
 
-    private void processEntry(ServerWorld world, ChunkClimateWorkEntry entry, int currentEpoch) {
+    private void processEntry(ServerWorld world, ChunkClimateWorkEntry entry) {
         ChunkPos chunkPos = entry.chunkPos();
         if (world.isChunkLoaded(chunkPos.x, chunkPos.z)) return;
 
@@ -348,10 +290,7 @@ public final class UnloadedChunkCoverageBuilder {
             try {
                 Identifier id = Identifier.of(biomeId);
                 var biomeRegistry = world.getRegistryManager().get(RegistryKeys.BIOME);
-                var opt = biomeRegistry.getEntry(RegistryKey.of(RegistryKeys.BIOME, id));
-                if (opt.isPresent()) {
-                    biomeEntry = opt.get();
-                }
+                biomeEntry = biomeRegistry.getEntry(RegistryKey.of(RegistryKeys.BIOME, id)).orElse(null);
             } catch (Exception ignored) {
             }
         }
@@ -360,13 +299,19 @@ public final class UnloadedChunkCoverageBuilder {
             biomeEntry = world.getBiome(samplePos);
             biomeId = biomeEntry.getKey().map(key -> key.getValue().toString()).orElse(null);
             if (biomeId == null || biomeId.isBlank()) return;
-            this.store.setStaticClimateSample(world, chunkPos, biomeId, surfaceY);
         }
 
-        RuntimeTypes.CoverageSample sample = this.provider.snapshotCoverageSample(world, samplePos, biomeEntry);
-        boolean snowy = this.provider.shouldSampleSnowCoverage(this.activeSeasonSnapshot, sample);
-        this.store.setCoverageState(world, chunkPos, currentEpoch, snowy);
-        SeasonCacheMod.get().onChunkCoverageComputed(world, chunkPos, currentEpoch, snowy);
+        this.store.setStaticClimateSample(world, chunkPos, biomeId, surfaceY);
+
+        RuntimeTypes.ChunkSeasonRule rule = this.store.getChunkSeasonRule(world, chunkPos);
+        if (rule == null) {
+            rule = ChunkSeasonReconciler.buildChunkSeasonRule(samplePos, biomeEntry, SeasonCacheMod.get().seasonRuleConfig());
+            this.store.setChunkSeasonRule(world, chunkPos, rule);
+        }
+
+        int currentEpoch = this.epochService.currentEpoch(world);
+        int seasonIndex = SeasonCacheMod.get().seasonRuleConfig().seasonIndex(this.provider.snapshot(world).seasonKey());
+        SeasonCacheMod.get().onChunkCoverageComputed(world, chunkPos, currentEpoch, rule.isSnowyInSeason(seasonIndex));
     }
 
     private static long elapsedMillis(long startNs) {
@@ -377,7 +322,7 @@ public final class UnloadedChunkCoverageBuilder {
         Path root = world.getServer().getSavePath(WorldSavePath.ROOT);
         String dimPath = world.getRegistryKey() == World.OVERWORLD ? "region"
                 : "dimensions/" + world.getRegistryKey().getValue().getNamespace()
-                  + "/" + world.getRegistryKey().getValue().getPath() + "/region";
+                + "/" + world.getRegistryKey().getValue().getPath() + "/region";
         return root.resolve(dimPath);
     }
 
@@ -404,28 +349,26 @@ public final class UnloadedChunkCoverageBuilder {
                     entries.put(entry.chunkKey, new ChunkClimateWorkEntry(new ChunkPos(entry.chunkKey), entry.surfaceY, entry.biomeId));
                 }
             }
-            return new StaticRegionSnapshot(disk.dataEpoch, disk.knownChunkCount, entries);
+            return new StaticRegionSnapshot(disk.knownChunkCount, entries);
         } catch (Exception e) {
             return StaticRegionSnapshot.EMPTY;
         }
     }
 
-    /** Identifies which dispatch path produced a batch, for completion counters and logging. */
-    private enum RegionPath { PRE_WARM, RE_DERIVE, FULL_SCAN }
+    private enum RegionPath { STATIC_ONLY, FULL_SCAN }
 
-    private record RegionBatch(List<ChunkClimateWorkEntry> entries, RegionPath path) {
+    private record RegionBatch(List<ChunkClimateWorkEntry> entries, RegionPath path, int regionX, int regionZ, int knownChunkCount) {
     }
 
     private record ChunkClimateWorkEntry(ChunkPos chunkPos, int surfaceY, String biomeId) {
     }
 
-    private record StaticRegionSnapshot(int dataEpoch, int knownChunkCount, Map<Long, ChunkClimateWorkEntry> entries) {
-        private static final StaticRegionSnapshot EMPTY = new StaticRegionSnapshot(0, 0, Map.of());
+    private record StaticRegionSnapshot(int knownChunkCount, Map<Long, ChunkClimateWorkEntry> entries) {
+        private static final StaticRegionSnapshot EMPTY = new StaticRegionSnapshot(0, Map.of());
     }
 
     private static final class RegionSidecarDisk {
         int schemaVersion = 0;
-        int dataEpoch = 0;
         int knownChunkCount = 0;
         StaticClimateEntryDisk[] staticClimateSamples = new StaticClimateEntryDisk[0];
     }

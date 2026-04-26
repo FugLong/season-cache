@@ -167,8 +167,7 @@ public final class SeasonCacheConfig {
                 this.cleanupMode,
                 this.trackSnow,
                 this.trackIce,
-                this.neverTouchPerennialColumns,
-                this.hysteresisBandWidth
+                this.neverTouchPerennialColumns
         );
     }
 

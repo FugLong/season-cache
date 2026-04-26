@@ -80,26 +80,11 @@ public interface SeasonProvider {
     }
 
     /**
-     * Captures the minimal seasonal state needed to classify coarse unloaded-chunk
-     * snow coverage off the main thread.
+     * Returns the seasonally adjusted temperature SS would use for the supplied
+     * biome/position right now. Used only when building persistent chunk rules.
      */
-    RuntimeTypes.CoverageSeasonSnapshot snapshotCoverageSeason(ServerWorld world);
-
-    /**
-     * Captures the minimal biome/sample data needed to classify a coarse unloaded
-     * chunk snow decision off the main thread. The caller is responsible for
-     * obtaining any world-dependent values (height, biome lookup, temperature at pos)
-     * on the server thread before calling this.
-     */
-    RuntimeTypes.CoverageSample snapshotCoverageSample(ServerWorld world, BlockPos pos,
+    float sampleSeasonalTemperature(ServerWorld world, BlockPos pos,
             RegistryEntry<Biome> biome);
-
-    /**
-     * Pure coarse unloaded-chunk snow decision using immutable sampled data and a
-     * season snapshot captured on the server thread.
-     */
-    boolean shouldSampleSnowCoverage(RuntimeTypes.CoverageSeasonSnapshot seasonSnapshot,
-            RuntimeTypes.CoverageSample sample);
 
     /**
      * Tier 2 snow decision. Uses SS's season-aware temperature to compute a

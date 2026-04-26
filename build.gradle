@@ -1,5 +1,5 @@
 plugins {
-    id "fabric-loom" version "1.7-SNAPSHOT"
+    id "fabric-loom" version "1.7.4"
     id "java"
     id "com.modrinth.minotaur" version "2.+"
 }
@@ -66,7 +66,7 @@ modrinth {
     additionalFiles = [sourcesJar]
     gameVersions = ["1.21.1"]
     loaders = ["fabric"]
-    changelog = file("PATCH_NOTES.txt").text
+    changelog = file("CHANGELOG.md").text
     dependencies {
         // Serene Seasons — required
         required.project "serene-seasons"

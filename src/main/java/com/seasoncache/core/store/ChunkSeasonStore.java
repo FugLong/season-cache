@@ -24,113 +24,95 @@ import java.util.Objects;
 import java.util.Set;
 
 /**
- * Stores per-region season clearing state and per-chunk climate decision caches.
+ * Persistent chunk-rule sidecar store.
  *
- * Data model:
- *   - Each region tracks which chunks have been cleared this epoch (sparse set).
- *   - Each chunk also caches the per-column snow/ice decisions computed by the
- *     reconciler on its first pass of a new epoch (shouldSnowBits / shouldIceBits).
- *     Subsequent reconcile passes within the same epoch use these cached bits
- *     directly without querying Serene Seasons again.
- *   - If every known chunk in a region has been cleared, the region is promoted to
- *     "fully clean" via regionEpoch, and future chunk loads skip the entire region.
- *   - All per-chunk data (cleared set + climate cache) is tied to dataEpoch and is
- *     discarded when the epoch changes.
+ * Authoritative state is intentionally minimal:
+ *   - staticClimateSamples (persistent inputs)
+ *   - chunkSeasonRules   (persistent truth)
+ *   - clearedChunks      (per-epoch applied state only)
  *
- * Threading model:
- *   All public methods are called from the server tick thread under synchronized(this).
- *   Disk IO is delegated to RegionIOThread — the tick thread never blocks on disk.
- *
- *   On a region cache miss, an empty placeholder is installed immediately and a load
- *   task is submitted to RegionIOThread. The placeholder means the chunk is treated
- *   as "not clean" and enqueued for reconciliation. When the load completes the
- *   placeholder is replaced with real data. At worst a chunk is reconciled once with
- *   a cold cache (correct, if slightly redundant).
- *
- *   Write tasks snapshot data at submission time (under the store monitor on the tick
- *   thread) so the IO thread never needs to acquire the store monitor during the
- *   actual disk write. A per-path pending-write set prevents redundant writes: if a
- *   write task is already queued for a region, new changes just leave dirty=true and
- *   the post-write callback re-submits with the latest snapshot.
- *
- * On-disk format: per-region JSON sidecar (one file per region per dimension).
- * Schema version 5 — includes persistent static chunk climate samples in addition to exact climate bits and coarse unloaded snow coverage.
+ * Legacy coverage/climate fields remain only as empty compatibility fields on disk so
+ * older sidecars can be read and then rewritten into the simplified schema.
  */
 public final class ChunkSeasonStore {
-    public static final int CURRENT_SCHEMA_VERSION = 5;
-    public static final int CLIMATE_BITS_WORDS = 4; // 4 longs = 256 bits = one bit per column
+    private static final Gson GSON = new GsonBuilder().setPrettyPrinting().create();
 
-    private static final Gson GSON = new GsonBuilder().create();
-
-    private final Map<RegionKey, RegionData> loadedRegions = new HashMap<>();
-
-    // Tracks regions with a write task already in the IO queue.
-    // Protected by synchronized(this). Used to prevent redundant writes.
-    private final Set<Path> pendingWritePaths = new HashSet<>();
+    public static final int CURRENT_SCHEMA_VERSION = 7;
 
     private RegionIOThread ioThread;
+    private final Map<RegionKey, RegionData> loadedRegions = new HashMap<>();
+    private final Set<Path> pendingWritePaths = new HashSet<>();
 
     public void setIOThread(RegionIOThread ioThread) {
         this.ioThread = ioThread;
     }
 
-    // -------------------------------------------------------------------------
-    // Public API — clearing state
-    // -------------------------------------------------------------------------
-
-    /**
-     * Returns true if the chunk has already been cleared during the current epoch,
-     * or if its entire region has been marked fully clean.
-     *
-     * Always submits region loads at HIGH priority — the caller is actively evaluating
-     * this chunk and wants the sidecar data as soon as possible.
-     *
-     * Even on a promoted region we verify chunk membership to handle newly generated
-     * chunks that appear after promotion.
-     */
     public synchronized boolean isChunkClean(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
-
-        if (region.regionEpoch == currentEpoch) {
-            if (region.clearedChunks.contains(chunkPos.toLong())) {
-                return true;
-            }
-            // New chunk in a promoted region — revoke promotion.
-            region.regionEpoch = 0;
-            region.knownChunkCount++;
-            region.dirty = true;
-            return false;
-        }
-
-        if (region.dataEpoch != currentEpoch) return false;
-        return region.clearedChunks.contains(chunkPos.toLong());
+        return region.dataEpoch == currentEpoch && region.clearedChunks.contains(chunkPos.toLong());
     }
 
-    /**
-     * Records that the given chunk has been cleared this epoch.
-     * Promotes the region to fully clean if all known chunks are now covered.
-     *
-     * clearedChunks is intentionally NOT cleared on promotion — it must stay
-     * populated so isChunkClean can verify individual membership when new chunks
-     * appear in a promoted region.
-     */
     public synchronized void markChunkCleared(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
         RegionData region = getOrSubmitLoad(world, chunkPos, false);
         ensureEpoch(region, currentEpoch);
-        region.clearedChunks.add(chunkPos.toLong());
-        region.dirty = true;
-
-        if (region.knownChunkCount > 0 && region.clearedChunks.size() >= region.knownChunkCount) {
-            region.regionEpoch = currentEpoch;
+        if (region.clearedChunks.add(chunkPos.toLong())) {
+            region.dirty = true;
+            submitWriteIfDirty(region);
         }
+    }
 
-        submitWriteIfDirty(region);
+    public synchronized void unmarkChunkCleared(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
+        RegionData region = getOrSubmitLoad(world, chunkPos, true);
+        if (region.dataEpoch == currentEpoch && region.clearedChunks.remove(chunkPos.toLong())) {
+            region.dirty = true;
+            submitWriteIfDirty(region);
+        }
     }
 
     /**
-     * Records the number of chunks that exist in this region (from the Anvil header).
-     * Used to determine when a region can be promoted to fully clean.
+     * Returns true if this chunk has already received its baseline sweep pass for the
+     * given epoch. When true, SS is considered the authority on block state for this
+     * chunk until the epoch changes — the on-load sweep will not fire again.
      */
+    public synchronized boolean isChunkSwept(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
+        RegionData region = getOrSubmitLoad(world, chunkPos, true);
+        Integer swept = region.sweepEpochs.get(chunkPos.toLong());
+        return swept != null && swept == currentEpoch;
+    }
+
+    /**
+     * Records that this chunk has received its baseline sweep pass for the given epoch.
+     * Persisted to disk so server restarts within the same season do not re-sweep chunks
+     * that SS has already had time to naturally adjust.
+     */
+    public synchronized void markChunkSwept(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
+        RegionData region = getOrSubmitLoad(world, chunkPos, false);
+        long key = chunkPos.toLong();
+        // Clear the pending unmark — reconcile has now confirmed the correct state.
+        region.pendingSweepUnmarks.remove(key);
+        Integer existing = region.sweepEpochs.get(key);
+        if (existing == null || existing != currentEpoch) {
+            region.sweepEpochs.put(key, currentEpoch);
+            region.dirty = true;
+            submitWriteIfDirty(region);
+        }
+    }
+
+    /**
+     * Clears the sweep record for this chunk, forcing a fresh baseline pass next time
+     * it loads. Used by /seasoncache sweep to recover from incorrect reconciliation.
+     */
+    public synchronized void unmarkChunkSwept(ServerWorld world, ChunkPos chunkPos) {
+        RegionData region = getOrSubmitLoad(world, chunkPos, true);
+        long key = chunkPos.toLong();
+        region.sweepEpochs.remove(key);
+        // Track the unmark intent so mergeLoadedIntoExisting doesn't restore the
+        // disk-persisted sweep record if the async IO load completes after this call.
+        region.pendingSweepUnmarks.add(key);
+        region.dirty = true;
+        submitWriteIfDirty(region);
+    }
+
     public synchronized void setKnownChunkCount(ServerWorld world, int regionX, int regionZ, int count) {
         RegionData region = getOrSubmitLoad(world, new ChunkPos(regionX * 32, regionZ * 32), false);
         if (region.knownChunkCount != count) {
@@ -140,46 +122,7 @@ public final class ChunkSeasonStore {
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Public API — per-chunk climate cache
-    // -------------------------------------------------------------------------
-
-    /**
-     * Returns the cached per-column climate decision bits for the given chunk, or
-     * null if no valid cache exists for the current epoch.
-     *
-     * @return long[2][4] where [0]=shouldSnowBits, [1]=shouldIceBits, or null
-     */
-    public synchronized long[][] getClimateBits(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
-        RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        if (region.dataEpoch != currentEpoch) return null;
-        return region.climateBits.get(chunkPos.toLong());
-    }
-
-    /**
-     * Stores per-column climate decision bits for the given chunk.
-     * Called by the reconciler after computing fresh SS decisions on a cold-cache chunk.
-     */
-    public synchronized void setClimateBits(
-            ServerWorld world, ChunkPos chunkPos, int currentEpoch,
-            long[] snowBits, long[] iceBits
-    ) {
-        RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        ensureEpoch(region, currentEpoch);
-        region.climateBits.put(chunkPos.toLong(), new long[][]{snowBits, iceBits});
-        region.dirty = true;
-        submitWriteIfDirty(region);
-    }
-
-
-    /**
-     * Stores the persistent static chunk climate sample used to derive coarse
-     * unloaded snow coverage quickly on future epoch changes. This data is not tied
-     * to a specific season epoch.
-     */
-    public synchronized void setStaticClimateSample(
-            ServerWorld world, ChunkPos chunkPos, String biomeId, int surfaceY
-    ) {
+    public synchronized void setStaticClimateSample(ServerWorld world, ChunkPos chunkPos, String biomeId, int surfaceY) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
         RuntimeTypes.StaticChunkClimate current = region.staticClimateSamples.get(chunkPos.toLong());
         RuntimeTypes.StaticChunkClimate next = new RuntimeTypes.StaticChunkClimate(biomeId, surfaceY);
@@ -189,260 +132,103 @@ public final class ChunkSeasonStore {
         submitWriteIfDirty(region);
     }
 
-    /**
-     * Returns the persistent static chunk climate sample for this chunk, or null if
-     * the chunk has not yet been analysed. Static climate samples survive epoch
-     * changes.
-     */
     public synchronized RuntimeTypes.StaticChunkClimate getStaticClimateSample(ServerWorld world, ChunkPos chunkPos) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
         return region.staticClimateSamples.get(chunkPos.toLong());
     }
 
-    /**
-     * Returns true when a persistent static chunk climate sample exists for the chunk.
-     */
     public synchronized boolean hasStaticClimateSample(ServerWorld world, ChunkPos chunkPos) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
         return region.staticClimateSamples.containsKey(chunkPos.toLong());
     }
 
-
-
-
-
-    /**
-     * Stores coarse chunk-level coverage flags for an unloaded chunk. These are used
-     * as approximate authoritative shader inputs until an exact loaded-chunk reconcile
-     * produces full per-column climate bits for the same epoch.
-     */
-    public synchronized void setCoverageState(
-            ServerWorld world, ChunkPos chunkPos, int currentEpoch,
-            boolean snowy
-    ) {
+    public synchronized void setChunkSeasonRule(ServerWorld world, ChunkPos chunkPos, RuntimeTypes.ChunkSeasonRule rule) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        ensureEpoch(region, currentEpoch);
-        boolean[] current = region.coverageStates.get(chunkPos.toLong());
-        if (current != null && current.length > 0 && current[0] == snowy) return;
-        region.coverageStates.put(chunkPos.toLong(), new boolean[]{snowy});
+        RuntimeTypes.ChunkSeasonRule current = region.chunkSeasonRules.get(chunkPos.toLong());
+        if (Objects.equals(current, rule)) return;
+        region.chunkSeasonRules.put(chunkPos.toLong(), rule);
         region.dirty = true;
         submitWriteIfDirty(region);
     }
 
-    /**
-     * Sweeps all in-memory regions and collects every chunk with a snowy=true
-     * coverage state for the given epoch into the provided set.
-     *
-     * Called at season transition before flushAll() runs so the full picture of
-     * winter snowy chunks is captured into a plain set that lives independently
-     * of the store — immune to epoch eviction and coverage re-derive overwrites.
-     */
-    /**
-     * Sweeps all coverage data — both in-memory regions and sidecar files on disk —
-     * and collects every chunk with a snowy=true coverage state for the given epoch.
-     *
-     * Called at season transition before flushAll() runs. In-memory regions are read
-     * directly. Disk sidecars that haven't been loaded into memory yet (typically
-     * distant regions outside render distance) are read from disk directly so the
-     * complete picture of snowy chunks is captured, not just what happened to be
-     * resident in memory during the session.
-     *
-     * Runs synchronously on the server tick thread — acceptable cost for a one-shot
-     * transition operation.
-     */
+    public synchronized RuntimeTypes.ChunkSeasonRule getChunkSeasonRule(ServerWorld world, ChunkPos chunkPos) {
+        RegionData region = getOrSubmitLoad(world, chunkPos, true);
+        return region.chunkSeasonRules.get(chunkPos.toLong());
+    }
+
+    public synchronized boolean hasChunkSeasonRule(ServerWorld world, ChunkPos chunkPos) {
+        RegionData region = getOrSubmitLoad(world, chunkPos, true);
+        return region.chunkSeasonRules.containsKey(chunkPos.toLong());
+    }
+
     public synchronized void collectSnowyChunks(ServerWorld world, int epoch, Set<ChunkPos> out) {
+        int seasonIndex = SeasonCacheMod.get().seasonRuleConfig()
+                .seasonIndex(SeasonCacheMod.get().seasonProvider().snapshot(world).seasonKey());
         String dimensionId = world.getRegistryKey().getValue().toString();
-
-        // Pass 1: in-memory regions — fast, no IO.
         for (Map.Entry<RegionKey, RegionData> entry : this.loadedRegions.entrySet()) {
-            if (!entry.getKey().dimensionId.equals(dimensionId)) continue;
-            RegionData region = entry.getValue();
-            if (region.dataEpoch != epoch) continue;
-            for (Map.Entry<Long, boolean[]> coverage : region.coverageStates.entrySet()) {
-                if (coverage.getValue() != null
-                        && coverage.getValue().length > 0
-                        && coverage.getValue()[0]) {
-                    out.add(new ChunkPos(coverage.getKey()));
+            if (!Objects.equals(entry.getKey().dimensionId, dimensionId)) continue;
+            for (Map.Entry<Long, RuntimeTypes.ChunkSeasonRule> ruleEntry : entry.getValue().chunkSeasonRules.entrySet()) {
+                if (ruleEntry.getValue().isSnowyInSeason(seasonIndex)) {
+                    out.add(new ChunkPos(ruleEntry.getKey()));
                 }
-            }
-        }
-
-        // Pass 2: sidecar files on disk that aren't loaded in memory yet.
-        // These are the distant regions outside render distance that were never
-        // requested this session but hold authoritative winter coverage data.
-        String dimPath = world.getRegistryKey().getValue().getPath();
-        Path sidecarDir = world.getServer().getSavePath(WorldSavePath.ROOT)
-                .resolve("seasoncache")
-                .resolve(dimPath);
-
-        if (!Files.isDirectory(sidecarDir)) return;
-
-        // Build a set of paths already covered by in-memory regions to avoid
-        // double-counting chunks whose region is in memory and also on disk.
-        Set<Path> inMemoryPaths = new HashSet<>();
-        for (RegionKey key : this.loadedRegions.keySet()) {
-            if (!key.dimensionId.equals(dimensionId)) continue;
-            inMemoryPaths.add(sidecarPath(world, key.regionX, key.regionZ));
-        }
-
-        List<Path> diskFiles = new ArrayList<>();
-        try (var stream = Files.list(sidecarDir)) {
-            stream.filter(p -> p.toString().endsWith(".json"))
-                  .filter(p -> !inMemoryPaths.contains(p))
-                  .forEach(diskFiles::add);
-        } catch (IOException e) {
-            SeasonCacheMod.LOGGER.warn(
-                    "Season Cache: failed to enumerate sidecars for snowy chunk sweep.", e);
-            return;
-        }
-
-        for (Path path : diskFiles) {
-            try (Reader reader = Files.newBufferedReader(path)) {
-                RegionDataDisk disk = GSON.fromJson(reader, RegionDataDisk.class);
-                if (disk == null || disk.dataEpoch != epoch) continue;
-                if (disk.coverageStates == null) continue;
-                for (CoverageEntryDisk entry : disk.coverageStates) {
-                    if (entry != null && entry.snow) {
-                        out.add(new ChunkPos(entry.chunkKey));
-                    }
-                }
-            } catch (Exception e) {
-                // Skip unreadable sidecars — missing chunks will be caught by
-                // the normal reconcile path when they eventually load.
-                SeasonCacheMod.LOGGER.debug(
-                        "Season Cache: skipping unreadable sidecar {} during snowy sweep: {}",
-                        path.getFileName(), e.getMessage());
             }
         }
     }
 
-
-    /**
-     * Returns the coarse chunk-level snow boolean for the current epoch, or null if no
-     * unloaded coverage cache exists for the chunk.
-     */
     public synchronized Boolean getCoverageSnowState(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
-        RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        if (region.dataEpoch != currentEpoch) return null;
-
-        boolean[] state = region.coverageStates.get(chunkPos.toLong());
-        if (state == null || state.length == 0) return null;
-        return state[0];
+        RuntimeTypes.ChunkSeasonRule rule = getChunkSeasonRule(world, chunkPos);
+        if (rule == null) return null;
+        int seasonIndex = SeasonCacheMod.get().seasonRuleConfig()
+                .seasonIndex(SeasonCacheMod.get().seasonProvider().snapshot(world).seasonKey());
+        return rule.isSnowyInSeason(seasonIndex);
     }
 
-    /**
-     * Returns true when exact per-column climate bits are cached for the chunk in the
-     * current epoch.
-     */
-    public synchronized boolean hasExactClimateBits(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
-        RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        return region.dataEpoch == currentEpoch && region.climateBits.containsKey(chunkPos.toLong());
-    }
-
-    /**
-     * Returns the best currently available authoritative chunk snow boolean:
-     * exact reconcile data when present, otherwise unloaded coverage data.
-     */
     public synchronized Boolean getAuthoritativeChunkSnowState(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
-        Boolean exact = getChunkSnowState(world, chunkPos, currentEpoch);
-        if (exact != null) return exact;
-        return getCoverageSnowState(world, chunkPos, currentEpoch);
+        RuntimeTypes.ChunkSeasonRule rule = getChunkSeasonRule(world, chunkPos);
+        if (rule == null) return null;
+        int seasonIndex = SeasonCacheMod.get().seasonRuleConfig()
+                .seasonIndex(SeasonCacheMod.get().seasonProvider().snapshot(world).seasonKey());
+        return rule.isSnowyInSeason(seasonIndex);
     }
 
-    /**
-     * Returns a snapshot of all authoritative chunk snow states currently held in
-     * memory for the requested dimension and epoch. Exact climate bits override
-     * coarse unloaded coverage when both exist for the same chunk.
-     */
     public synchronized List<AuthoritativeChunkState> snapshotAuthoritativeChunkSnowStates(ServerWorld world, int currentEpoch) {
         List<AuthoritativeChunkState> states = new ArrayList<>();
+        int seasonIndex = SeasonCacheMod.get().seasonRuleConfig()
+                .seasonIndex(SeasonCacheMod.get().seasonProvider().snapshot(world).seasonKey());
         String dimensionId = world.getRegistryKey().getValue().toString();
 
         for (Map.Entry<RegionKey, RegionData> entry : this.loadedRegions.entrySet()) {
             if (!Objects.equals(entry.getKey().dimensionId, dimensionId)) continue;
-
-            RegionData region = entry.getValue();
-            if (region.dataEpoch != currentEpoch) continue;
-
-            Map<Long, Boolean> merged = new HashMap<>();
-            for (Map.Entry<Long, boolean[]> coverageEntry : region.coverageStates.entrySet()) {
-                boolean[] coverage = coverageEntry.getValue();
-                if (coverage != null && coverage.length > 0) {
-                    merged.put(coverageEntry.getKey(), coverage[0]);
-                }
-            }
-            for (Map.Entry<Long, long[][]> climateEntry : region.climateBits.entrySet()) {
-                long[][] bits = climateEntry.getValue();
-                if (bits == null || bits.length == 0 || bits[0] == null) continue;
-                merged.put(climateEntry.getKey(), hasAnySetBit(bits[0]));
-            }
-
-            for (Map.Entry<Long, Boolean> mergedEntry : merged.entrySet()) {
-                states.add(new AuthoritativeChunkState(new ChunkPos(mergedEntry.getKey()), mergedEntry.getValue()));
+            for (Map.Entry<Long, RuntimeTypes.ChunkSeasonRule> ruleEntry : entry.getValue().chunkSeasonRules.entrySet()) {
+                states.add(new AuthoritativeChunkState(
+                        new ChunkPos(ruleEntry.getKey()),
+                        ruleEntry.getValue().isSnowyInSeason(seasonIndex)
+                ));
             }
         }
-
         return states;
     }
 
-    /**
-     * Returns the authoritative chunk snow boolean for the current epoch, or null if
-     * the chunk has not yet been reconciled/cached for that epoch.
-     *
-     * A chunk is considered snowy when any bit in its cached shouldSnow mask is set.
-     */
     public synchronized Boolean getChunkSnowState(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
-        RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        if (region.dataEpoch != currentEpoch) return null;
-
-        long[][] bits = region.climateBits.get(chunkPos.toLong());
-        if (bits == null || bits.length == 0 || bits[0] == null) return null;
-
-        return hasAnySetBit(bits[0]);
+        return getAuthoritativeChunkSnowState(world, chunkPos, currentEpoch);
     }
 
-    /**
-     * Ensures the sidecar for the given region is loaded into memory.
-     *
-     * Called during server start for regions whose cached epoch already matches the
-     * current season — their coverage and climate data is correct on disk and only
-     * needs to be in memory before the first player snapshot is built. No reconciliation
-     * or coverage recomputation is performed; this is purely a background load trigger.
-     *
-     * Safe to call from the IO thread (acquires the store monitor internally).
-     */
     public synchronized void preWarmRegion(ServerWorld world, int regionX, int regionZ) {
         getOrSubmitLoad(world, new ChunkPos(regionX * 32, regionZ * 32), false);
     }
 
-    // -------------------------------------------------------------------------
-    // Public API — admin / invalidation
-    // -------------------------------------------------------------------------
-
-    /**
-     * Performs a global invalidate.
-     *
-     * In-memory state is cleared immediately on the tick thread.
-     * On-disk sidecar zeroing is submitted as a LOW priority background task.
-     * Progress is tracked via RegionIOThread.invalidationProgress().
-     */
     public synchronized void invalidateAll(MinecraftServer server) {
         for (RegionData region : this.loadedRegions.values()) {
-            region.clearedChunks.clear();
-            region.climateBits.clear();
-            region.coverageStates.clear();
-            region.staticClimateSamples.clear();
             region.dataEpoch = 0;
-            region.regionEpoch = 0;
+            region.clearedChunks.clear();
+            region.staticClimateSamples.clear();
+            region.chunkSeasonRules.clear();
             region.dirty = true;
         }
-
-        // Submit writes for zeroed in-memory regions.
         for (RegionData region : this.loadedRegions.values()) {
             submitWriteIfDirty(region);
         }
 
-        // Collect in-memory paths to skip in the disk walk.
         Set<Path> inMemoryPaths = new HashSet<>();
         for (RegionData region : this.loadedRegions.values()) {
             inMemoryPaths.add(region.path);
@@ -454,11 +240,10 @@ public final class ChunkSeasonStore {
         List<Path> diskFiles = new ArrayList<>();
         try (var stream = Files.walk(sidecarRoot)) {
             stream.filter(p -> p.toString().endsWith(".json"))
-                  .filter(p -> !inMemoryPaths.contains(p))
-                  .forEach(diskFiles::add);
+                    .filter(p -> !inMemoryPaths.contains(p))
+                    .forEach(diskFiles::add);
         } catch (IOException e) {
-            SeasonCacheMod.LOGGER.warn(
-                "Season Cache: failed to enumerate sidecar files for invalidation walk.", e);
+            SeasonCacheMod.LOGGER.warn("Season Cache: failed to enumerate sidecar files for invalidation walk.", e);
             return;
         }
 
@@ -470,34 +255,51 @@ public final class ChunkSeasonStore {
         });
     }
 
-    // -------------------------------------------------------------------------
-    // Public API — status counters
-    // -------------------------------------------------------------------------
+    public synchronized void invalidateDynamicStateKeepStatic(MinecraftServer server, boolean clearRules) {
+        for (RegionData region : this.loadedRegions.values()) {
+            region.dataEpoch = 0;
+            region.clearedChunks.clear();
+            if (clearRules) {
+                region.chunkSeasonRules.clear();
+            }
+            region.dirty = true;
+        }
+        for (RegionData region : this.loadedRegions.values()) {
+            submitWriteIfDirty(region);
+        }
+
+        Set<Path> inMemoryPaths = new HashSet<>();
+        for (RegionData region : this.loadedRegions.values()) {
+            inMemoryPaths.add(region.path);
+        }
+
+        Path sidecarRoot = server.getSavePath(WorldSavePath.ROOT).resolve("seasoncache");
+        if (!Files.isDirectory(sidecarRoot)) return;
+
+        List<Path> diskFiles = new ArrayList<>();
+        try (var stream = Files.walk(sidecarRoot)) {
+            stream.filter(p -> p.toString().endsWith(".json"))
+                    .filter(p -> !inMemoryPaths.contains(p))
+                    .forEach(diskFiles::add);
+        } catch (IOException e) {
+            SeasonCacheMod.LOGGER.warn("Season Cache: failed to enumerate sidecar files for rule invalidation walk.", e);
+            return;
+        }
+
+        this.ioThread.submitInvalidationWalk(diskFiles.size(), () -> {
+            for (Path path : diskFiles) {
+                zeroDynamicStateOnDisk(path, clearRules);
+                this.ioThread.incrementInvalidationProgress();
+            }
+        });
+    }
 
     public synchronized int clearedChunkCount(int currentEpoch) {
         int count = 0;
         for (RegionData region : this.loadedRegions.values()) {
-            if (region.regionEpoch == currentEpoch) {
-                count += region.knownChunkCount > 0 ? region.knownChunkCount : region.clearedChunks.size();
-            } else if (region.dataEpoch == currentEpoch) {
+            if (region.dataEpoch == currentEpoch) {
                 count += region.clearedChunks.size();
             }
-        }
-        return count;
-    }
-
-    public synchronized int cachedClimateChunkCount(int currentEpoch) {
-        int count = 0;
-        for (RegionData region : this.loadedRegions.values()) {
-            if (region.dataEpoch == currentEpoch) count += region.climateBits.size();
-        }
-        return count;
-    }
-
-    public synchronized int cachedCoverageChunkCount(int currentEpoch) {
-        int count = 0;
-        for (RegionData region : this.loadedRegions.values()) {
-            if (region.dataEpoch == currentEpoch) count += region.coverageStates.size();
         }
         return count;
     }
@@ -510,14 +312,6 @@ public final class ChunkSeasonStore {
         return count;
     }
 
-    public synchronized int fullyCleanRegionCount(int currentEpoch) {
-        int count = 0;
-        for (RegionData region : this.loadedRegions.values()) {
-            if (region.regionEpoch == currentEpoch) count++;
-        }
-        return count;
-    }
-
     public synchronized int dirtyRegionCount() {
         int count = 0;
         for (RegionData region : this.loadedRegions.values()) {
@@ -526,43 +320,19 @@ public final class ChunkSeasonStore {
         return count;
     }
 
-    /**
-     * Submits write tasks for all in-memory regions regardless of dirty state.
-     * Called on season change (async write) and server shutdown (write then drain).
-     */
     public synchronized void flushAll() {
         for (RegionData region : this.loadedRegions.values()) {
-            region.dirty = true; // force write even if already considered clean
+            region.dirty = true;
             submitWriteIfDirty(region);
         }
     }
 
-    /**
-     * Submits write tasks for dirty in-memory regions.
-     * Called when the precache builder completes its scan.
-     */
     public synchronized void flushDirty() {
         for (RegionData region : this.loadedRegions.values()) {
             submitWriteIfDirty(region);
         }
     }
 
-    // -------------------------------------------------------------------------
-    // Internal — region access
-    // -------------------------------------------------------------------------
-
-    /**
-     * Returns the in-memory RegionData for the given chunk's region.
-     *
-     * Cache hit: returns immediately.
-     * Cache miss: installs an empty placeholder, submits a background load task,
-     *   returns the placeholder. When the load completes, the placeholder is
-     *   replaced under the store's monitor.
-     *
-     * @param isHighPriority if true, submits the load at HIGH priority (active
-     *                       reconciliation is waiting). Otherwise MEDIUM or LOW
-     *                       depending on player neighbourhood.
-     */
     private RegionData getOrSubmitLoad(ServerWorld world, ChunkPos chunkPos, boolean isHighPriority) {
         int regionX = Math.floorDiv(chunkPos.x, 32);
         int regionZ = Math.floorDiv(chunkPos.z, 32);
@@ -581,13 +351,8 @@ public final class ChunkSeasonStore {
             RegionData loaded = readRegionFromDisk(path);
             synchronized (ChunkSeasonStore.this) {
                 RegionData current = this.loadedRegions.get(key);
-                if (current == null || current == placeholder) {
-                    if (current == null) {
-                        this.loadedRegions.put(key, loaded);
-                    } else {
-                        mergeLoadedIntoExisting(current, loaded);
-                        this.loadedRegions.put(key, current);
-                    }
+                if (current == null) {
+                    this.loadedRegions.put(key, loaded);
                 } else {
                     mergeLoadedIntoExisting(current, loaded);
                 }
@@ -597,13 +362,6 @@ public final class ChunkSeasonStore {
         return placeholder;
     }
 
-
-    /**
-     * Merges freshly loaded sidecar data into an existing in-memory region placeholder
-     * or mutated region. Existing in-memory epoch data and static climate samples win
-     * over older on-disk values so background region loads cannot silently discard
-     * updates produced while the load was in flight.
-     */
     private static void mergeLoadedIntoExisting(RegionData existing, RegionData loaded) {
         if (existing.knownChunkCount == 0) {
             existing.knownChunkCount = loaded.knownChunkCount;
@@ -611,22 +369,27 @@ public final class ChunkSeasonStore {
             existing.knownChunkCount = Math.max(existing.knownChunkCount, loaded.knownChunkCount);
         }
 
+        // Only merge clearedChunks when epochs agree. If existing has already been
+        // advanced to a new epoch by ensureEpoch, don't let stale disk data pollute it.
         if (existing.dataEpoch == 0) {
             existing.dataEpoch = loaded.dataEpoch;
-            existing.regionEpoch = loaded.regionEpoch;
             existing.clearedChunks.addAll(loaded.clearedChunks);
-            existing.climateBits.putAll(loaded.climateBits);
-            existing.coverageStates.putAll(loaded.coverageStates);
         } else if (existing.dataEpoch == loaded.dataEpoch) {
-            loaded.clearedChunks.forEach(existing.clearedChunks::add);
-            loaded.climateBits.forEach(existing.climateBits::putIfAbsent);
-            loaded.coverageStates.forEach(existing.coverageStates::putIfAbsent);
-            if (existing.regionEpoch == 0) {
-                existing.regionEpoch = loaded.regionEpoch;
-            }
+            existing.clearedChunks.addAll(loaded.clearedChunks);
         }
+        // If epochs differ, existing was already advanced past what's on disk — discard
+        // the stale clearedChunks from the loaded data entirely.
 
         loaded.staticClimateSamples.forEach(existing.staticClimateSamples::putIfAbsent);
+        loaded.chunkSeasonRules.forEach(existing.chunkSeasonRules::putIfAbsent);
+
+        // Respect explicit unmark intents — don't restore sweep records for chunks
+        // where unmarkChunkSwept was called since the region was loaded.
+        loaded.sweepEpochs.forEach((key, epoch) -> {
+            if (!existing.pendingSweepUnmarks.contains(key)) {
+                existing.sweepEpochs.putIfAbsent(key, epoch);
+            }
+        });
     }
 
     private RegionData readRegionFromDisk(Path path) {
@@ -635,76 +398,54 @@ public final class ChunkSeasonStore {
 
         try (Reader reader = Files.newBufferedReader(path)) {
             RegionDataDisk disk = GSON.fromJson(reader, RegionDataDisk.class);
-            if (disk != null) {
-                if (disk.schemaVersion != CURRENT_SCHEMA_VERSION) {
-                    SeasonCacheMod.LOGGER.warn(
-                        "Season Cache: sidecar {} has schema version {} (expected {}), " +
-                        "discarding incompatible data. Region will rebuild from scratch.",
-                        path.getFileName(), disk.schemaVersion, CURRENT_SCHEMA_VERSION);
-                } else {
-                    region.dataEpoch = disk.dataEpoch;
-                    region.regionEpoch = disk.regionEpoch;
-                    region.knownChunkCount = disk.knownChunkCount;
-                    if (disk.clearedChunks != null) {
-                        for (long k : disk.clearedChunks) region.clearedChunks.add(k);
+            if (disk == null) return region;
+
+            region.knownChunkCount = disk.knownChunkCount;
+
+            if (disk.staticClimateSamples != null) {
+                for (StaticClimateEntryDisk entry : disk.staticClimateSamples) {
+                    if (entry != null && entry.biomeId != null && !entry.biomeId.isBlank()) {
+                        region.staticClimateSamples.put(entry.chunkKey,
+                                new RuntimeTypes.StaticChunkClimate(entry.biomeId, entry.surfaceY));
                     }
-                    if (disk.climateBits != null) {
-                        for (ClimateEntryDisk entry : disk.climateBits) {
-                            if (entry != null && entry.snowBits != null && entry.iceBits != null
-                                    && entry.snowBits.length == CLIMATE_BITS_WORDS
-                                    && entry.iceBits.length == CLIMATE_BITS_WORDS) {
-                                region.climateBits.put(entry.chunkKey,
-                                        new long[][]{entry.snowBits, entry.iceBits});
-                            }
+                }
+            }
+
+            if (disk.schemaVersion == CURRENT_SCHEMA_VERSION) {
+                if (disk.chunkSeasonRules != null) {
+                    for (RuleEntryDisk entry : disk.chunkSeasonRules) {
+                        if (entry != null) {
+                            region.chunkSeasonRules.put(entry.chunkKey,
+                                    new RuntimeTypes.ChunkSeasonRule(entry.snowEpochMask, entry.perennialNoTouch));
                         }
                     }
-                    if (disk.coverageStates != null) {
-                        for (CoverageEntryDisk entry : disk.coverageStates) {
-                            if (entry != null) {
-                                region.coverageStates.put(entry.chunkKey, new boolean[]{entry.snow});
-                            }
-                        }
+                }
+
+                region.dataEpoch = disk.dataEpoch;
+                if (disk.clearedChunks != null) {
+                    for (long key : disk.clearedChunks) {
+                        region.clearedChunks.add(key);
                     }
-                    if (disk.staticClimateSamples != null) {
-                        for (StaticClimateEntryDisk entry : disk.staticClimateSamples) {
-                            if (entry != null && entry.biomeId != null && !entry.biomeId.isBlank()) {
-                                region.staticClimateSamples.put(entry.chunkKey,
-                                        new RuntimeTypes.StaticChunkClimate(entry.biomeId, entry.surfaceY));
-                            }
+                }
+                if (disk.sweepEpochs != null) {
+                    for (SweepEntryDisk entry : disk.sweepEpochs) {
+                        if (entry != null) {
+                            region.sweepEpochs.put(entry.chunkKey, entry.epoch);
                         }
                     }
                 }
             }
         } catch (Exception e) {
             SeasonCacheMod.LOGGER.warn(
-                "Season Cache: failed to read sidecar {}, starting fresh for this region.",
-                path.getFileName(), e);
+                    "Season Cache: failed to read sidecar {}, starting fresh for this region.",
+                    path.getFileName(), e);
         }
         return region;
     }
 
-    // -------------------------------------------------------------------------
-    // Internal — write path
-    // -------------------------------------------------------------------------
-
-    /**
-     * Submits a write task for the given region if it is dirty and no write task
-     * is already pending for it.
-     *
-     * If a write task is already queued (pendingWritePaths contains region.path),
-     * the dirty flag is left true. The post-write callback checks this flag and
-     * re-submits if needed, ensuring no update is silently lost.
-     *
-     * The data snapshot is taken here, under the store monitor (tick thread).
-     * The IO thread receives an immutable snapshot and never acquires the store
-     * monitor during the actual disk write.
-     */
     private void submitWriteIfDirty(RegionData region) {
         if (!region.dirty) return;
-        if (this.pendingWritePaths.contains(region.path)) {
-            // Write already queued. Leave dirty=true — post-write callback will re-submit.
-            return;
-        }
+        if (this.pendingWritePaths.contains(region.path)) return;
 
         RegionDataDisk snapshot = snapshotToDisk(region);
         region.dirty = false;
@@ -714,7 +455,6 @@ public final class ChunkSeasonStore {
             writeSnapshot(snapshot, region.path);
             synchronized (ChunkSeasonStore.this) {
                 this.pendingWritePaths.remove(region.path);
-                // New changes may have arrived while the write was executing.
                 if (region.dirty) {
                     submitWriteIfDirty(region);
                 }
@@ -722,33 +462,11 @@ public final class ChunkSeasonStore {
         });
     }
 
-    /**
-     * Snapshots a RegionData into a serialisable disk object.
-     * Must be called under the store monitor (tick thread).
-     */
     private static RegionDataDisk snapshotToDisk(RegionData region) {
         RegionDataDisk disk = new RegionDataDisk();
         disk.dataEpoch = region.dataEpoch;
-        disk.regionEpoch = region.regionEpoch;
         disk.knownChunkCount = region.knownChunkCount;
         disk.clearedChunks = region.clearedChunks.stream().mapToLong(Long::longValue).toArray();
-        disk.climateBits = region.climateBits.entrySet().stream()
-                .map(e -> {
-                    ClimateEntryDisk entry = new ClimateEntryDisk();
-                    entry.chunkKey = e.getKey();
-                    entry.snowBits = e.getValue()[0];
-                    entry.iceBits  = e.getValue()[1];
-                    return entry;
-                })
-                .toArray(ClimateEntryDisk[]::new);
-        disk.coverageStates = region.coverageStates.entrySet().stream()
-                .map(e -> {
-                    CoverageEntryDisk entry = new CoverageEntryDisk();
-                    entry.chunkKey = e.getKey();
-                    entry.snow = e.getValue()[0];
-                    return entry;
-                })
-                .toArray(CoverageEntryDisk[]::new);
         disk.staticClimateSamples = region.staticClimateSamples.entrySet().stream()
                 .map(e -> {
                     StaticClimateEntryDisk entry = new StaticClimateEntryDisk();
@@ -758,13 +476,27 @@ public final class ChunkSeasonStore {
                     return entry;
                 })
                 .toArray(StaticClimateEntryDisk[]::new);
+        disk.chunkSeasonRules = region.chunkSeasonRules.entrySet().stream()
+                .map(e -> {
+                    RuleEntryDisk entry = new RuleEntryDisk();
+                    entry.chunkKey = e.getKey();
+                    entry.snowEpochMask = e.getValue().snowEpochMask();
+                    entry.perennialNoTouch = e.getValue().perennialNoTouch();
+                    return entry;
+                })
+                .toArray(RuleEntryDisk[]::new);
+        disk.sweepEpochs = region.sweepEpochs.entrySet().stream()
+                .filter(e -> e.getValue() == region.dataEpoch)
+                .map(e -> {
+                    SweepEntryDisk entry = new SweepEntryDisk();
+                    entry.chunkKey = e.getKey();
+                    entry.epoch = e.getValue();
+                    return entry;
+                })
+                .toArray(SweepEntryDisk[]::new);
         return disk;
     }
 
-    /**
-     * Writes a pre-built disk snapshot to the given path.
-     * Runs entirely on the IO thread. Never acquires the store monitor.
-     */
     private static void writeSnapshot(RegionDataDisk snapshot, Path path) {
         try {
             Files.createDirectories(path.getParent());
@@ -773,48 +505,49 @@ public final class ChunkSeasonStore {
             }
         } catch (Exception e) {
             SeasonCacheMod.LOGGER.error(
-                "Season Cache: failed to write sidecar {}. Data may be lost on restart.",
-                path.getFileName(), e);
+                    "Season Cache: failed to write sidecar {}. Data may be lost on restart.",
+                    path.getFileName(), e);
         }
-    }
-
-
-    private static boolean hasAnySetBit(long[] words) {
-        for (long word : words) {
-            if (word != 0L) return true;
-        }
-        return false;
     }
 
     private static void zeroEpochsOnDisk(Path path) {
-        RegionDataDisk disk = null;
-        try (Reader reader = Files.newBufferedReader(path)) {
-            disk = GSON.fromJson(reader, RegionDataDisk.class);
-        } catch (Exception e) {
-            SeasonCacheMod.LOGGER.warn(
-                "Season Cache: failed to read sidecar {} during invalidation, skipping.",
-                path.getFileName(), e);
-            return;
-        }
+        RegionDataDisk disk = readRegionDataDisk(path);
         if (disk == null) return;
-
         disk.dataEpoch = 0;
         disk.regionEpoch = 0;
         disk.clearedChunks = new long[0];
-        disk.climateBits = new ClimateEntryDisk[0];
-        disk.coverageStates = new CoverageEntryDisk[0];
         disk.staticClimateSamples = new StaticClimateEntryDisk[0];
-        // knownChunkCount preserved intentionally.
-
+        disk.chunkSeasonRules = new RuleEntryDisk[0];
         writeSnapshot(disk, path);
+    }
+
+    private static void zeroDynamicStateOnDisk(Path path, boolean clearRules) {
+        RegionDataDisk disk = readRegionDataDisk(path);
+        if (disk == null) return;
+        disk.dataEpoch = 0;
+        disk.regionEpoch = 0;
+        disk.clearedChunks = new long[0];
+        if (clearRules) {
+            disk.chunkSeasonRules = new RuleEntryDisk[0];
+        }
+        writeSnapshot(disk, path);
+    }
+
+    private static RegionDataDisk readRegionDataDisk(Path path) {
+        try (Reader reader = Files.newBufferedReader(path)) {
+            return GSON.fromJson(reader, RegionDataDisk.class);
+        } catch (Exception e) {
+            SeasonCacheMod.LOGGER.warn(
+                    "Season Cache: failed to read sidecar {} during invalidation, skipping.",
+                    path.getFileName(), e);
+            return null;
+        }
     }
 
     private static void ensureEpoch(RegionData region, int currentEpoch) {
         if (region.dataEpoch != currentEpoch) {
-            region.clearedChunks.clear();
-            region.climateBits.clear();
-            region.coverageStates.clear();
             region.dataEpoch = currentEpoch;
+            region.clearedChunks.clear();
         }
     }
 
@@ -825,10 +558,6 @@ public final class ChunkSeasonStore {
                 .resolve(dimPath)
                 .resolve("r." + regionX + "." + regionZ + ".json");
     }
-
-    // -------------------------------------------------------------------------
-    // Inner types
-    // -------------------------------------------------------------------------
 
     private static final class RegionKey {
         private final String dimensionId;
@@ -845,8 +574,8 @@ public final class ChunkSeasonStore {
         public boolean equals(Object obj) {
             if (!(obj instanceof RegionKey other)) return false;
             return this.regionX == other.regionX
-                && this.regionZ == other.regionZ
-                && Objects.equals(this.dimensionId, other.dimensionId);
+                    && this.regionZ == other.regionZ
+                    && Objects.equals(this.dimensionId, other.dimensionId);
         }
 
         @Override
@@ -858,15 +587,17 @@ public final class ChunkSeasonStore {
     private static final class RegionData {
         private final Path path;
         private int dataEpoch = 0;
-        private int regionEpoch = 0;
         private int knownChunkCount = 0;
         private final Set<Long> clearedChunks = new HashSet<>();
-        // chunkKey → [snowBits(4 longs), iceBits(4 longs)]
-        private final Map<Long, long[][]> climateBits = new HashMap<>();
-        // chunkKey → [snowy] coarse unloaded snow coverage for the current epoch
-        private final Map<Long, boolean[]> coverageStates = new HashMap<>();
-        // chunkKey → persistent static chunk climate sample used for fast epoch derivation
         private final Map<Long, RuntimeTypes.StaticChunkClimate> staticClimateSamples = new HashMap<>();
+        private final Map<Long, RuntimeTypes.ChunkSeasonRule> chunkSeasonRules = new HashMap<>();
+        private final Map<Long, Integer> sweepEpochs = new HashMap<>();
+        /**
+         * Chunk keys where unmarkChunkSwept was called but the async IO load has not
+         * yet completed. Prevents mergeLoadedIntoExisting from restoring stale sweep
+         * records from disk that were explicitly cleared this session.
+         */
+        private final Set<Long> pendingSweepUnmarks = new HashSet<>();
         private boolean dirty = false;
 
         private RegionData(Path path) {
@@ -880,28 +611,28 @@ public final class ChunkSeasonStore {
         int regionEpoch = 0;
         int knownChunkCount = 0;
         long[] clearedChunks = new long[0];
-        ClimateEntryDisk[] climateBits = new ClimateEntryDisk[0];
-        CoverageEntryDisk[] coverageStates = new CoverageEntryDisk[0];
         StaticClimateEntryDisk[] staticClimateSamples = new StaticClimateEntryDisk[0];
+        RuleEntryDisk[] chunkSeasonRules = new RuleEntryDisk[0];
+        SweepEntryDisk[] sweepEpochs = new SweepEntryDisk[0];
     }
 
     public record AuthoritativeChunkState(ChunkPos chunkPos, boolean snowy) {
-    }
-
-    private static final class ClimateEntryDisk {
-        long chunkKey;
-        long[] snowBits;
-        long[] iceBits;
-    }
-
-    private static final class CoverageEntryDisk {
-        long chunkKey;
-        boolean snow;
     }
 
     private static final class StaticClimateEntryDisk {
         long chunkKey;
         String biomeId;
         int surfaceY;
+    }
+
+    private static final class RuleEntryDisk {
+        long chunkKey;
+        int snowEpochMask;
+        boolean perennialNoTouch;
+    }
+
+    private static final class SweepEntryDisk {
+        long chunkKey;
+        int epoch;
     }
 }

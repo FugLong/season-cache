@@ -4,11 +4,14 @@ import com.seasoncache.SeasonCacheMod;
 import com.seasoncache.config.SeasonCacheConfig;
 import com.seasoncache.core.store.ChunkSeasonStore;
 import com.seasoncache.integration.SeasonProvider;
+import com.seasoncache.ModTags;
 import net.minecraft.block.Block;
 import net.minecraft.block.BlockState;
 import net.minecraft.block.Blocks;
 import net.minecraft.fluid.FluidState;
 import net.minecraft.fluid.Fluids;
+import net.minecraft.registry.RegistryKey;
+import net.minecraft.registry.RegistryKeys;
 import net.minecraft.registry.entry.RegistryEntry;
 import net.minecraft.server.world.ServerWorld;
 import net.minecraft.util.Identifier;
@@ -16,41 +19,18 @@ import net.minecraft.util.math.BlockPos;
 import net.minecraft.util.math.ChunkPos;
 import net.minecraft.world.Heightmap;
 import net.minecraft.world.biome.Biome;
-import net.minecraft.world.chunk.ChunkSection;
-import net.minecraft.world.chunk.WorldChunk;
+import sereneseasons.api.season.Season;
+import sereneseasons.season.SeasonHooks;
 
 /**
- * Reconciles loaded chunks against the current seasonal snow/ice state.
+ * Chunk-granular loaded-chunk reconciler.
  *
- * Decision model:
- *   1. Primary: coarse chunk-level boolean from getAuthoritativeChunkSnowState —
- *      the same signal driving the LOD shader.
- *   2. Neighbour gate (removal and addition): before acting on a coverage value
- *      that would change the chunk's state, check loaded cardinal neighbours.
- *      Loaded neighbours with coverage data vote snowy/not-snowy. Unloaded or
- *      data-absent neighbours abstain. If not-snowy votes don't clearly outweigh
- *      snowy votes, the decision is inconclusive.
- *   3. Multi-point fallback (only when inconclusive): sample 4 quadrant positions
- *      within the chunk via the same temperature oracle as the coverage builder.
- *      Majority of those samples determines the final decision.
- *
- * The neighbour gate and multi-point fallback only apply when coverage would
- * cause a state change (removal when snowy=false, addition when snowy=true).
- * Chunks where coverage agrees with current block state skip both checks entirely.
- *
- * Block scan: ChunkSection.hasAny() palette check skips sections with no snow or
- * ice without iterating their blocks. Only sections containing target blocks are
- * iterated — far cheaper than the previous per-column world-query approach.
+ * Seasonal truth comes only from the persistent chunk rule cache. Runtime work is
+ * limited to ensuring a rule exists, resolving the current season bit, applying
+ * add/remove work for the chunk, and marking the chunk applied for the epoch.
  */
 public final class ChunkSeasonReconciler {
-
-    // Quadrant sample offsets within a 16x16 chunk (local coords).
-    // Four points away from the center to avoid structure bias at (8,8).
-    private static final int[][] QUADRANT_OFFSETS = { {4,4}, {12,4}, {4,12}, {12,12} };
-
-    // Minimum not-snowy votes required from loaded neighbours to proceed with
-    // removal without the multi-point fallback. Requires clear agreement.
-    private static final int NOT_SNOWY_VOTE_THRESHOLD = 3;
+    private static final float SNOW_FREEZE_THRESHOLD = 0.15f;
 
     private final SeasonCacheConfig config;
     private final SeasonProvider provider;
@@ -69,268 +49,165 @@ public final class ChunkSeasonReconciler {
         this.store = store;
     }
 
-    /**
-     * Removal-only reconcile path for season transition.
-     *
-     * Called when the chunk was confirmed snowy=true in the outgoing epoch's
-     * coverage snapshot. Uses multiPointSample to verify whether the chunk
-     * should be snowy in the NEW season — biomes that remain cold across the
-     * transition (snowy_taiga, snowy_plains etc.) correctly keep their snow.
-     * Only removes snow if the new season says not-snowy. Placement for
-     * chunks that stay snowy is left to the normal reconcile path (aggressive
-     * mode), since this path is removal-focused.
-     */
-    public void reconcileRemoveOnly(ServerWorld world, ChunkPos chunkPos) {
-        int currentEpoch = this.epochService.currentEpoch(world);
-
-        if (this.store.isChunkClean(world, chunkPos, currentEpoch)) return;
-
-        // Ask the new season: should this chunk still be snowy?
-        // 4 SS temperature calls — cheap, and ensures we don't incorrectly
-        // strip snow from cold biomes that remain below threshold in the new season.
-        boolean snowy = multiPointSample(world, chunkPos);
-
-        if (!snowy) {
-            WorldChunk chunk = world.getChunk(chunkPos.x, chunkPos.z);
-            ChunkSection[] sections = chunk.getSectionArray();
-            int bottomY = world.getBottomY();
-            BlockPos.Mutable pos = new BlockPos.Mutable();
-
-            for (int sectionIdx = 0; sectionIdx < sections.length; sectionIdx++) {
-                ChunkSection section = sections[sectionIdx];
-                if (section == null || section.isEmpty()) continue;
-                if (!sectionMayContainSnowOrIce(section)) continue;
-
-                int sectionBaseY = bottomY + sectionIdx * 16;
-
-                for (int localY = 0; localY < 16; localY++) {
-                    for (int localZ = 0; localZ < 16; localZ++) {
-                        for (int localX = 0; localX < 16; localX++) {
-                            BlockState state = section.getBlockState(localX, localY, localZ);
-                            if (state.isAir()) continue;
-
-                            int worldX = chunkPos.getStartX() + localX;
-                            int worldY = sectionBaseY + localY;
-                            int worldZ = chunkPos.getStartZ() + localZ;
-                            pos.set(worldX, worldY, worldZ);
-
-                            if (this.config.trackSnow && state.isOf(Blocks.SNOW)) {
-                                world.setBlockState(pos, Blocks.AIR.getDefaultState(),
-                                        Block.NOTIFY_LISTENERS);
-                                continue;
-                            }
-                            if (this.config.trackIce && state.isOf(Blocks.ICE)) {
-                                world.setBlockState(pos, Blocks.WATER.getDefaultState(),
-                                        Block.NOTIFY_LISTENERS);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        this.store.setCoverageState(world, chunkPos, currentEpoch, snowy);
-        this.store.markChunkCleared(world, chunkPos, currentEpoch);
-        SeasonCacheMod.get().onChunkAuthoritativelyReconciled(world, chunkPos, currentEpoch);
-    }
-
     public void reconcile(ServerWorld world, ChunkPos chunkPos) {
         int currentEpoch = this.epochService.currentEpoch(world);
-
         if (this.store.isChunkClean(world, chunkPos, currentEpoch)) return;
 
-        // Primary decision: coarse chunk-level coverage authority.
-        // If coverage hasn't been computed yet for the current epoch (e.g. during a
-        // re-derive after a season transition), fall through to multiPointSample rather
-        // than returning early — the transition window is exactly when we need to act,
-        // and 4 SS temperature queries is far cheaper than leaving snow in place.
-        Boolean coverageSnowy = this.store.getAuthoritativeChunkSnowState(world, chunkPos, currentEpoch);
-        boolean snowy = (coverageSnowy != null)
-                ? resolveSnowy(world, chunkPos, currentEpoch, coverageSnowy)
-                : multiPointSample(world, chunkPos);
+        RuntimeTypes.ChunkSeasonRule rule = ensureChunkSeasonRule(world, chunkPos);
+        if (rule == null) return;
 
-        boolean aggressive = this.config.cleanupMode == SeasonCacheConfig.CleanupMode.AGGRESSIVE;
+        if (rule.perennialNoTouch() && this.config.neverTouchPerennialColumns) {
+            this.store.markChunkCleared(world, chunkPos, currentEpoch);
+            SeasonCacheMod.get().onChunkAuthoritativelyReconciled(world, chunkPos, currentEpoch);
+            return;
+        }
 
-        WorldChunk chunk = world.getChunk(chunkPos.x, chunkPos.z);
-        ChunkSection[] sections = chunk.getSectionArray();
+        int seasonIdx = currentSeasonIndex(world);
+        if (seasonIdx < 0) {
+            // Season key not in rule config — can't determine truth safely.
+            // Skip without marking clean so the chunk is retried next tick.
+            SeasonCacheMod.LOGGER.warn("Season Cache: unknown season key '{}' for chunk {} — skipping reconcile.",
+                    this.provider.snapshot(world).seasonKey(), chunkPos);
+            return;
+        }
+
+        boolean snowy = rule.isSnowyInSeason(seasonIdx);
+        applyChunkTruth(world, chunkPos, snowy);
+        this.store.markChunkCleared(world, chunkPos, currentEpoch);
+        SeasonCacheMod.get().onChunkAuthoritativelyReconciled(world, chunkPos, currentEpoch);
+    }
+
+    public boolean prepareChunkRule(ServerWorld world, ChunkPos chunkPos) {
+        return ensureChunkSeasonRule(world, chunkPos) != null;
+    }
+
+    private int currentSeasonIndex(ServerWorld world) {
+        String seasonKey = this.provider.snapshot(world).seasonKey();
+        return SeasonCacheMod.get().seasonRuleConfig().seasonIndex(seasonKey);
+    }
+
+    private RuntimeTypes.ChunkSeasonRule ensureChunkSeasonRule(ServerWorld world, ChunkPos chunkPos) {
+        RuntimeTypes.ChunkSeasonRule cachedRule = this.store.getChunkSeasonRule(world, chunkPos);
+        if (cachedRule != null) return cachedRule;
+
+        RuntimeTypes.StaticChunkClimate staticSample = this.store.getStaticClimateSample(world, chunkPos);
+        if (staticSample == null) {
+            staticSample = createStaticClimateSample(world, chunkPos);
+            if (staticSample == null) return null;
+            this.store.setStaticClimateSample(world, chunkPos, staticSample.biomeId(), staticSample.surfaceY());
+        }
+
+        RuntimeTypes.ChunkSeasonRule rule = buildChunkSeasonRule(world, chunkPos, staticSample);
+        if (rule == null) return null;
+        this.store.setChunkSeasonRule(world, chunkPos, rule);
+        return rule;
+    }
+
+    private RuntimeTypes.StaticChunkClimate createStaticClimateSample(ServerWorld world, ChunkPos chunkPos) {
+        int worldX = chunkPos.getStartX() + 8;
+        int worldZ = chunkPos.getStartZ() + 8;
+        int surfaceY = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, worldX, worldZ) - 1;
+        surfaceY = Math.max(surfaceY, world.getBottomY());
+        BlockPos samplePos = new BlockPos(worldX, surfaceY, worldZ);
+        RegistryEntry<Biome> biomeEntry = world.getBiome(samplePos);
+        String biomeId = biomeEntry.getKey().map(key -> key.getValue().toString()).orElse(null);
+        if (biomeId == null || biomeId.isBlank()) return null;
+        return new RuntimeTypes.StaticChunkClimate(biomeId, surfaceY);
+    }
+
+    private RuntimeTypes.ChunkSeasonRule buildChunkSeasonRule(
+            ServerWorld world,
+            ChunkPos chunkPos,
+            RuntimeTypes.StaticChunkClimate staticSample
+    ) {
+        int worldX = chunkPos.getStartX() + 8;
+        int worldZ = chunkPos.getStartZ() + 8;
+        BlockPos samplePos = new BlockPos(worldX, Math.max(staticSample.surfaceY(), world.getBottomY()), worldZ);
+
+        RegistryEntry<Biome> biomeEntry = resolveBiomeEntry(world, staticSample.biomeId());
+        if (biomeEntry == null) {
+            biomeEntry = world.getBiome(samplePos);
+        }
+
+        return buildChunkSeasonRule(samplePos, biomeEntry, SeasonCacheMod.get().seasonRuleConfig());
+    }
+
+    public static RuntimeTypes.ChunkSeasonRule buildChunkSeasonRule(
+            BlockPos samplePos,
+            RegistryEntry<Biome> biomeEntry,
+            RuntimeTypes.SeasonRuleConfig ruleConfig
+    ) {
+        int mask = 0;
+        if (ruleConfig.generateSnowIce() && biomeEntry.value().hasPrecipitation()) {
+            Season.SubSeason[] subSeasons = Season.SubSeason.values();
+            int limit = Math.min(12, subSeasons.length);
+            for (int i = 0; i < limit; i++) {
+                float seasonTemp = SeasonHooks.getBiomeTemperatureInSeason(subSeasons[i], biomeEntry, samplePos);
+                if (seasonTemp < SNOW_FREEZE_THRESHOLD) {
+                    mask |= (1 << i);
+                }
+            }
+        }
+
+        boolean perennial = mask == 0xFFF;
+        return new RuntimeTypes.ChunkSeasonRule(mask, perennial);
+    }
+
+    private RegistryEntry<Biome> resolveBiomeEntry(ServerWorld world, String biomeId) {
+        if (biomeId == null || biomeId.isBlank()) return null;
+        try {
+            Identifier id = Identifier.of(biomeId);
+            var biomeRegistry = world.getRegistryManager().get(RegistryKeys.BIOME);
+            return biomeRegistry.getEntry(RegistryKey.of(RegistryKeys.BIOME, id)).orElse(null);
+        } catch (Exception ignored) {
+            return null;
+        }
+    }
+
+    private void applyChunkTruth(ServerWorld world, ChunkPos chunkPos, boolean snowy) {
         int bottomY = world.getBottomY();
-
         BlockPos.Mutable pos = new BlockPos.Mutable();
 
-        for (int sectionIdx = 0; sectionIdx < sections.length; sectionIdx++) {
-            ChunkSection section = sections[sectionIdx];
-            if (section == null || section.isEmpty()) continue;
-            if (!sectionMayContainSnowOrIce(section)) continue;
+        // Removal is surface-only, symmetric with placement. Scanning all sections
+        // would destroy snow inside buildings, on tree decorations, and in structures.
+        // The heightmap gives us the exact surface layer where seasonal snow lives.
+        for (int localZ = 0; localZ < 16; localZ++) {
+            for (int localX = 0; localX < 16; localX++) {
+                int worldX = chunkPos.getStartX() + localX;
+                int worldZ = chunkPos.getStartZ() + localZ;
+                // getTopY returns the first air block above the surface, so topY-1 is the
+                // surface block (e.g. grass). Snow layers sit ON TOP of the surface at topY,
+                // and ice replaces the surface block at topY-1. Check both positions so we
+                // catch snow regardless of whether it is included in the heightmap or not.
+                int surfaceY = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, worldX, worldZ) - 1;
+                if (surfaceY < bottomY) continue;
 
-            int sectionBaseY = bottomY + sectionIdx * 16;
-
-            for (int localY = 0; localY < 16; localY++) {
-                for (int localZ = 0; localZ < 16; localZ++) {
-                    for (int localX = 0; localX < 16; localX++) {
-                        BlockState state = section.getBlockState(localX, localY, localZ);
-                        if (state.isAir()) continue;
-
-                        int worldX = chunkPos.getStartX() + localX;
-                        int worldY = sectionBaseY + localY;
-                        int worldZ = chunkPos.getStartZ() + localZ;
-                        pos.set(worldX, worldY, worldZ);
-
-                        if (this.config.trackSnow && state.isOf(Blocks.SNOW)) {
-                            if (!snowy) {
-                                world.setBlockState(pos, Blocks.AIR.getDefaultState(),
-                                        Block.NOTIFY_LISTENERS);
-                            }
-                            continue;
-                        }
-
-                        if (this.config.trackIce && state.isOf(Blocks.ICE)) {
-                            if (!snowy) {
-                                world.setBlockState(pos, Blocks.WATER.getDefaultState(),
-                                        Block.NOTIFY_LISTENERS);
-                            }
-                        }
+                if (!snowy) {
+                    // Check topY (snow on top of surface)
+                    pos.set(worldX, surfaceY + 1, worldZ);
+                    BlockState above = world.getBlockState(pos);
+                    if (this.config.trackSnow && above.isOf(Blocks.SNOW)) {
+                        world.setBlockState(pos, Blocks.AIR.getDefaultState(), Block.NOTIFY_LISTENERS);
+                    }
+                    // Check topY-1 (ice in place of surface block, or snow if heightmap included it)
+                    pos.set(worldX, surfaceY, worldZ);
+                    BlockState surface = world.getBlockState(pos);
+                    if (this.config.trackSnow && surface.isOf(Blocks.SNOW)) {
+                        world.setBlockState(pos, Blocks.AIR.getDefaultState(), Block.NOTIFY_LISTENERS);
+                    } else if (this.config.trackIce && surface.isOf(Blocks.ICE)) {
+                        world.setBlockState(pos, Blocks.WATER.getDefaultState(), Block.NOTIFY_LISTENERS);
                     }
                 }
             }
         }
 
-        if (aggressive && snowy) {
-            placeSnowAndIce(world, chunkPos, bottomY, pos);
-        }
-
-        // Confirm the resolved state back to the store so the delta pipeline works.
-        this.store.setCoverageState(world, chunkPos, currentEpoch, snowy);
-        this.store.markChunkCleared(world, chunkPos, currentEpoch);
-        SeasonCacheMod.get().onChunkAuthoritativelyReconciled(world, chunkPos, currentEpoch);
-    }
-
-    // -------------------------------------------------------------------------
-    // Decision resolution — neighbour gate + multi-point fallback
-    // -------------------------------------------------------------------------
-
-    /**
-     * Resolves the final snowy boolean for a chunk, applying neighbour gate and
-     * multi-point fallback when coverage would cause a block state change.
-     *
-     * Fast path: if the chunk has no snow or ice blocks and coverage says not-snowy,
-     * or if coverage says snowy and we're not in aggressive mode, there's nothing to
-     * change — return coverage directly without any additional checks.
-     *
-     * Neighbour gate: checks loaded cardinal neighbours. Each neighbour with coverage
-     * data in memory votes snowy or not-snowy. Unloaded or data-absent neighbours
-     * abstain. If not-snowy votes clearly outnumber snowy votes (>= threshold), the
-     * coverage value is trusted and returned. If snowy votes win or no clear majority
-     * exists, the decision is inconclusive.
-     *
-     * Multi-point fallback: samples 4 quadrant positions within the chunk using the
-     * same temperature oracle as the coverage builder. Majority of those 4 samples
-     * determines the final decision. Only fires when neighbour gate is inconclusive.
-     */
-    private boolean resolveSnowy(ServerWorld world, ChunkPos chunkPos,
-                                  int currentEpoch, boolean coverageSnowy) {
-        // If coverage says snowy, we need the neighbour gate to protect against
-        // spurious addition. If coverage says not-snowy, we need it to protect
-        // against spurious removal. Either way, run the gate.
-        int[] votes = countNeighbourVotes(world, chunkPos, currentEpoch);
-        int snowyVotes    = votes[0];
-        int notSnowyVotes = votes[1];
-        // votes[2] = abstentions (unloaded/no data) — not used directly
-
-        if (coverageSnowy) {
-            // Coverage says snowy — should we add snow?
-            // Clear not-snowy majority from neighbours overrides coverage.
-            if (notSnowyVotes >= NOT_SNOWY_VOTE_THRESHOLD && snowyVotes == 0) {
-                return multiPointSample(world, chunkPos);
-            }
-            // Neighbours agree or inconclusive — trust coverage.
-            return true;
-        } else {
-            // Coverage says not-snowy — should we remove snow?
-            // Clear not-snowy majority from neighbours confirms removal.
-            if (notSnowyVotes >= NOT_SNOWY_VOTE_THRESHOLD && snowyVotes == 0) {
-                return false;
-            }
-            // Snowy votes win or inconclusive — run multi-point to decide.
-            return multiPointSample(world, chunkPos);
+        if (snowy && this.config.cleanupMode == SeasonCacheConfig.CleanupMode.AGGRESSIVE) {
+            placeSnowAndIce(world, chunkPos, bottomY);
         }
     }
 
-    /**
-     * Counts snowy and not-snowy votes from the four cardinal neighbours.
-     *
-     * Returns int[3]: [snowyVotes, notSnowyVotes, abstentions].
-     * Abstentions occur when a neighbour has no coverage data in memory —
-     * either unloaded or not yet processed by the coverage builder.
-     * Abstentions do not influence the vote outcome.
-     */
-    private int[] countNeighbourVotes(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
-        int snowyVotes = 0;
-        int notSnowyVotes = 0;
-        int abstentions = 0;
-
-        int[][] deltas = { {0,-1}, {0,1}, {-1,0}, {1,0} };
-        for (int[] d : deltas) {
-            ChunkPos neighbour = new ChunkPos(chunkPos.x + d[0], chunkPos.z + d[1]);
-            Boolean state = this.store.getCoverageSnowState(world, neighbour, currentEpoch);
-            if (state == null) {
-                abstentions++;
-            } else if (state) {
-                snowyVotes++;
-            } else {
-                notSnowyVotes++;
-            }
-        }
-
-        return new int[]{ snowyVotes, notSnowyVotes, abstentions };
-    }
-
-    /**
-     * Samples 4 quadrant positions within the chunk using the same temperature
-     * oracle as the coverage builder. Returns true if the majority (3 or more of 4)
-     * sample positions indicate snowy conditions.
-     *
-     * Only called when the neighbour gate is inconclusive. The 4 quadrant positions
-     * avoid the center point (8,8) which is susceptible to structure heightmap bias.
-     */
-    private boolean multiPointSample(ServerWorld world, ChunkPos chunkPos) {
-        BlockPos.Mutable samplePos = new BlockPos.Mutable();
-        int snowyCount = 0;
-
-        for (int[] offset : QUADRANT_OFFSETS) {
-            int worldX = chunkPos.getStartX() + offset[0];
-            int worldZ = chunkPos.getStartZ() + offset[1];
-            int surfaceY = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,
-                    worldX, worldZ) - 1;
-            surfaceY = Math.max(surfaceY, world.getBottomY());
-            samplePos.set(worldX, surfaceY, worldZ);
-
-            RegistryEntry<Biome> biome = world.getBiome(samplePos);
-            RuntimeTypes.CoverageSample sample = this.provider.snapshotCoverageSample(
-                    world, samplePos, biome);
-            if (sample.snowy()) snowyCount++;
-        }
-
-        // Majority: 3 or more of 4 samples must agree to return snowy.
-        return snowyCount >= 3;
-    }
-
-    // -------------------------------------------------------------------------
-    // Section fast-path
-    // -------------------------------------------------------------------------
-
-    private boolean sectionMayContainSnowOrIce(ChunkSection section) {
-        return section.hasAny(state ->
-                (this.config.trackSnow && state.isOf(Blocks.SNOW))
-                || (this.config.trackIce && state.isOf(Blocks.ICE))
-        );
-    }
-
-    // -------------------------------------------------------------------------
-    // Aggressive placement
-    // -------------------------------------------------------------------------
-
-    private void placeSnowAndIce(ServerWorld world, ChunkPos chunkPos,
-                                  int bottomY, BlockPos.Mutable pos) {
+    private void placeSnowAndIce(ServerWorld world, ChunkPos chunkPos, int bottomY) {
+        BlockPos.Mutable pos = new BlockPos.Mutable();
         BlockPos.Mutable abovePos = new BlockPos.Mutable();
 
         for (int localZ = 0; localZ < 16; localZ++) {
@@ -350,6 +227,7 @@ public final class ChunkSeasonReconciler {
                     if (aboveState.isAir() && world.isSkyVisible(abovePos)) {
                         BlockState surfaceState = world.getBlockState(pos);
                         if (surfaceState.isFullCube(world, pos)
+                                && !surfaceState.isIn(ModTags.SNOW_PLACEMENT_BLACKLIST)
                                 && Blocks.SNOW.getDefaultState().canPlaceAt(world, abovePos)) {
                             world.setBlockState(abovePos, Blocks.SNOW.getDefaultState(),
                                     Block.NOTIFY_LISTENERS);
@@ -370,10 +248,6 @@ public final class ChunkSeasonReconciler {
             }
         }
     }
-
-    // -------------------------------------------------------------------------
-    // Shoreline helpers
-    // -------------------------------------------------------------------------
 
     private static boolean isShorelineAdjacent(ServerWorld world, BlockPos waterPos) {
         int x = waterPos.getX();

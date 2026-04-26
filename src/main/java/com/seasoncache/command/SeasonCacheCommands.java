@@ -43,7 +43,11 @@ public final class SeasonCacheCommands {
                         .then(CommandManager.literal("all")
                                 .executes(ctx -> invalidateAll(ctx.getSource()))))
                 .then(CommandManager.literal("debug")
-                        .executes(ctx -> runTempDebug(ctx.getSource()))));
+                        .executes(ctx -> runTempDebug(ctx.getSource())))
+                .then(CommandManager.literal("debugstate")
+                        .executes(ctx -> runDebugState(ctx.getSource())))
+                .then(CommandManager.literal("sweep")
+                        .executes(ctx -> runSweep(ctx.getSource()))));
     }
 
     private static int runStatus(ServerCommandSource source) {
@@ -69,16 +73,10 @@ public final class SeasonCacheCommands {
                 + " | provider=" + snapshot.providerId()
                 + " | season=" + snapshot.seasonKey()
                 + " | mode=" + mod.config().cleanupMode.name().toLowerCase()
-                + " | queue=" + mod.reconcileQueue().size()
+                + " | derive=" + mod.pendingDerivationCount()
                 + " | cleared=" + mod.store().clearedChunkCount(currentEpoch)
-                + " | climateCached=" + mod.store().cachedClimateChunkCount(currentEpoch)
                 + " | staticClimateCached=" + mod.store().cachedStaticClimateChunkCount()
-                + " | coverageCached=" + mod.store().cachedCoverageChunkCount(currentEpoch)
-                + " | cleanRegions=" + mod.store().fullyCleanRegionCount(currentEpoch)
                 + " | dirty=" + mod.store().dirtyRegionCount()
-                + " | precache=" + mod.precacheBuilder().processedFiles()
-                           + "/" + mod.precacheBuilder().totalFiles()
-                           + (mod.precacheBuilder().isActive() ? " (active)" : "")
                 + " | coverageBuild=" + mod.coverageBuilder().processedFiles()
                            + "/" + mod.coverageBuilder().totalFiles()
                            + (mod.coverageBuilder().isActive() ? " (active)" : "")
@@ -114,10 +112,8 @@ public final class SeasonCacheCommands {
 
         if (invalidateFirst) {
             mod.store().invalidateAll(source.getServer());
-            mod.reconcileQueue().clear();
         }
 
-        mod.precacheBuilder().start(overworld, profile);
         mod.coverageBuilder().start(overworld, profile);
         source.sendFeedback(() -> Text.literal(
                 (invalidateFirst ? "Rebuild" : "Build") + " started with "
@@ -133,7 +129,6 @@ public final class SeasonCacheCommands {
         // On-disk zeroing runs in the background on the IO thread at LOW priority.
         // Use /seasoncache status to monitor the disk pass progress before restarting.
         mod.store().invalidateAll(source.getServer());
-        mod.reconcileQueue().clear();
         ServerWorld overworld = source.getServer().getOverworld();
         if (overworld != null) {
             mod.coverageBuilder().start(overworld, mod.config().gameplayBudget);
@@ -246,6 +241,135 @@ public final class SeasonCacheCommands {
             }
         }
 
+        return 1;
+    }
+
+    /**
+     * /seasoncache debugstate
+     *
+     * Prints the cached store state for the 3x3 chunk grid centred on the executor.
+     * For each chunk shows:
+     *   - The cached static climate sample (biome ID + surface Y), or MISSING if not yet sampled
+     *   - The persistent season rule: 12-bit snow mask in binary (one bit per sub-season,
+     *     LSB = first season in SS order), the perennialNoTouch flag, and which seasons
+     *     are snowy according to the mask
+     *   - Whether the chunk has been marked clean (applied) for the current epoch
+     *   - The authoritative snow state the mod believes this chunk should have right now
+     *
+     * Reading the mask: each character is a sub-season in orderedSeasonKeys order.
+     * '1' = snowy that season, '0' = clear. The header line prints the full season
+     * order so you can map positions to names.
+     *
+     * What to look for:
+     *   MISSING rule    → chunk has not been processed by the coverage builder yet
+     *   perennial=true  → all 12 seasons are snowy; reconciler skips this chunk entirely
+     *                     when neverTouchPerennialColumns=true — snow will never be removed
+     *   clean=false     → chunk is queued or has not been reconciled for this epoch yet
+     *   snowy=false but snow visible → reconciler ran but applyChunkTruth missed it
+     *                                  (e.g. surface Y was wrong, chunk was loaded mid-build)
+     */
+    private static int runDebugState(ServerCommandSource source) {
+        SeasonCacheMod mod = SeasonCacheMod.get();
+        ServerWorld world = source.getWorld();
+
+        int currentEpoch = mod.epochService().currentEpoch(world);
+        RuntimeTypes.SeasonSnapshot snapshot = mod.seasonProvider().snapshot(world);
+        RuntimeTypes.SeasonRuleConfig ruleConfig = mod.seasonRuleConfig();
+        int currentSeasonIndex = ruleConfig.seasonIndex(snapshot.seasonKey());
+
+        // Build season order header — shows which bit position maps to which season
+        java.util.List<String> orderedKeys = ruleConfig.orderedSeasonKeys();
+        StringBuilder seasonHeader = new StringBuilder("seasons: ");
+        for (int i = 0; i < orderedKeys.size(); i++) {
+            if (i > 0) seasonHeader.append(", ");
+            seasonHeader.append(orderedKeys.get(i)).append("(").append(i).append(")");
+        }
+
+        ChunkPos playerChunk = new ChunkPos(BlockPos.ofFloored(source.getPosition()));
+
+        source.sendFeedback(() -> Text.literal(String.format(
+                "[SC DebugState | %s | idx=%d | epoch=%08x]",
+                snapshot.seasonKey(), currentSeasonIndex, currentEpoch
+        )), false);
+        source.sendFeedback(() -> Text.literal(seasonHeader.toString()), false);
+
+        for (int dz = -1; dz <= 1; dz++) {
+            for (int dx = -1; dx <= 1; dx++) {
+                ChunkPos chunkPos = new ChunkPos(playerChunk.x + dx, playerChunk.z + dz);
+
+                RuntimeTypes.StaticChunkClimate climate =
+                        mod.store().getStaticClimateSample(world, chunkPos);
+                RuntimeTypes.ChunkSeasonRule rule =
+                        mod.store().getChunkSeasonRule(world, chunkPos);
+                boolean clean = mod.store().isChunkClean(world, chunkPos, currentEpoch);
+                Boolean snowy = mod.store().getAuthoritativeChunkSnowState(world, chunkPos, currentEpoch);
+
+                final int fdx = dx, fdz = dz;
+
+                if (climate == null && rule == null) {
+                    source.sendFeedback(() -> Text.literal(String.format(
+                            "(%+d,%+d) [NO CACHE] chunk not yet processed",
+                            fdx, fdz
+                    )), false);
+                    continue;
+                }
+
+                // Build 12-char binary mask string, LSB first to match orderedSeasonKeys
+                String maskBits;
+                String snowySeasons;
+                if (rule != null) {
+                    StringBuilder bits = new StringBuilder();
+                    StringBuilder snowy_sb = new StringBuilder();
+                    int mask = rule.snowEpochMask();
+                    int limit = Math.min(12, orderedKeys.size());
+                    for (int i = 0; i < limit; i++) {
+                        boolean bit = (mask & (1 << i)) != 0;
+                        bits.append(bit ? '1' : '0');
+                        if (bit) {
+                            if (snowy_sb.length() > 0) snowy_sb.append('+');
+                            snowy_sb.append(orderedKeys.get(i));
+                        }
+                    }
+                    maskBits  = bits.toString();
+                    snowySeasons = snowy_sb.length() > 0 ? snowy_sb.toString() : "none";
+                } else {
+                    maskBits     = "NO RULE";
+                    snowySeasons = "?";
+                }
+
+                String climateStr = climate != null
+                        ? String.format("biome=%-35s surf=%d", climate.biomeId(), climate.surfaceY())
+                        : "climate=MISSING";
+                String ruleStr = rule != null
+                        ? String.format("mask=%s perennial=%-5b", maskBits, rule.perennialNoTouch())
+                        : "rule=MISSING";
+                String stateStr = String.format("clean=%-5b now=%s",
+                        clean, snowy == null ? "?" : (snowy ? "SNOWY" : "clear"));
+
+                source.sendFeedback(() -> Text.literal(String.format(
+                        "(%+d,%+d) %s | %s | %s",
+                        fdx, fdz, climateStr, ruleStr, stateStr
+                )), false);
+
+                // If snowy seasons is long, print it on a second line to keep lines readable
+                if (rule != null && snowySeasons.length() > 60) {
+                    final String fs = snowySeasons;
+                    source.sendFeedback(() -> Text.literal(
+                            "         snowy in: " + fs
+                    ), false);
+                }
+            }
+        }
+
+        return 1;
+    }
+
+    private static int runSweep(ServerCommandSource source) {
+        SeasonCacheMod mod = SeasonCacheMod.get();
+        mod.forceSweepLoadedChunks(source.getServer());
+        source.sendFeedback(() -> Text.literal(
+                "Season Cache: force sweep queued. All loaded chunks will be re-reconciled. Watch coverageBuild= in /seasoncache status."
+        ), true);
         return 1;
     }
 }
