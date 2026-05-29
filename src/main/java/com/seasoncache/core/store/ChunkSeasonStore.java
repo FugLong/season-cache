@@ -6,9 +6,9 @@ import com.seasoncache.SeasonCacheMod;
 import com.seasoncache.core.RuntimeTypes;
 import com.seasoncache.core.io.RegionIOThread;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.world.ServerWorld;
-import net.minecraft.util.WorldSavePath;
-import net.minecraft.util.math.ChunkPos;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.storage.LevelResource;
+import net.minecraft.world.level.ChunkPos;
 
 import java.io.IOException;
 import java.io.Reader;
@@ -47,23 +47,23 @@ public final class ChunkSeasonStore {
         this.ioThread = ioThread;
     }
 
-    public synchronized boolean isChunkClean(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
+    public synchronized boolean isChunkClean(ServerLevel world, ChunkPos chunkPos, int currentEpoch) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        return region.dataEpoch == currentEpoch && region.clearedChunks.contains(chunkPos.toLong());
+        return region.dataEpoch == currentEpoch && region.clearedChunks.contains(chunkPos.pack());
     }
 
-    public synchronized void markChunkCleared(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
+    public synchronized void markChunkCleared(ServerLevel world, ChunkPos chunkPos, int currentEpoch) {
         RegionData region = getOrSubmitLoad(world, chunkPos, false);
         ensureEpoch(region, currentEpoch);
-        if (region.clearedChunks.add(chunkPos.toLong())) {
+        if (region.clearedChunks.add(chunkPos.pack())) {
             region.dirty = true;
             submitWriteIfDirty(region);
         }
     }
 
-    public synchronized void unmarkChunkCleared(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
+    public synchronized void unmarkChunkCleared(ServerLevel world, ChunkPos chunkPos, int currentEpoch) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        if (region.dataEpoch == currentEpoch && region.clearedChunks.remove(chunkPos.toLong())) {
+        if (region.dataEpoch == currentEpoch && region.clearedChunks.remove(chunkPos.pack())) {
             region.dirty = true;
             submitWriteIfDirty(region);
         }
@@ -74,9 +74,9 @@ public final class ChunkSeasonStore {
      * given epoch. When true, SS is considered the authority on block state for this
      * chunk until the epoch changes — the on-load sweep will not fire again.
      */
-    public synchronized boolean isChunkSwept(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
+    public synchronized boolean isChunkSwept(ServerLevel world, ChunkPos chunkPos, int currentEpoch) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        Integer swept = region.sweepEpochs.get(chunkPos.toLong());
+        Integer swept = region.sweepEpochs.get(chunkPos.pack());
         return swept != null && swept == currentEpoch;
     }
 
@@ -85,9 +85,9 @@ public final class ChunkSeasonStore {
      * Persisted to disk so server restarts within the same season do not re-sweep chunks
      * that SS has already had time to naturally adjust.
      */
-    public synchronized void markChunkSwept(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
+    public synchronized void markChunkSwept(ServerLevel world, ChunkPos chunkPos, int currentEpoch) {
         RegionData region = getOrSubmitLoad(world, chunkPos, false);
-        long key = chunkPos.toLong();
+        long key = chunkPos.pack();
         // Clear the pending unmark — reconcile has now confirmed the correct state.
         region.pendingSweepUnmarks.remove(key);
         Integer existing = region.sweepEpochs.get(key);
@@ -102,9 +102,9 @@ public final class ChunkSeasonStore {
      * Clears the sweep record for this chunk, forcing a fresh baseline pass next time
      * it loads. Used by /seasoncache sweep to recover from incorrect reconciliation.
      */
-    public synchronized void unmarkChunkSwept(ServerWorld world, ChunkPos chunkPos) {
+    public synchronized void unmarkChunkSwept(ServerLevel world, ChunkPos chunkPos) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        long key = chunkPos.toLong();
+        long key = chunkPos.pack();
         region.sweepEpochs.remove(key);
         // Track the unmark intent so mergeLoadedIntoExisting doesn't restore the
         // disk-persisted sweep record if the async IO load completes after this call.
@@ -113,7 +113,7 @@ public final class ChunkSeasonStore {
         submitWriteIfDirty(region);
     }
 
-    public synchronized void setKnownChunkCount(ServerWorld world, int regionX, int regionZ, int count) {
+    public synchronized void setKnownChunkCount(ServerLevel world, int regionX, int regionZ, int count) {
         RegionData region = getOrSubmitLoad(world, new ChunkPos(regionX * 32, regionZ * 32), false);
         if (region.knownChunkCount != count) {
             region.knownChunkCount = count;
@@ -122,60 +122,60 @@ public final class ChunkSeasonStore {
         }
     }
 
-    public synchronized void setStaticClimateSample(ServerWorld world, ChunkPos chunkPos, String biomeId, int surfaceY) {
+    public synchronized void setStaticClimateSample(ServerLevel world, ChunkPos chunkPos, String biomeId, int surfaceY) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        RuntimeTypes.StaticChunkClimate current = region.staticClimateSamples.get(chunkPos.toLong());
+        RuntimeTypes.StaticChunkClimate current = region.staticClimateSamples.get(chunkPos.pack());
         RuntimeTypes.StaticChunkClimate next = new RuntimeTypes.StaticChunkClimate(biomeId, surfaceY);
         if (Objects.equals(current, next)) return;
-        region.staticClimateSamples.put(chunkPos.toLong(), next);
+        region.staticClimateSamples.put(chunkPos.pack(), next);
         region.dirty = true;
         submitWriteIfDirty(region);
     }
 
-    public synchronized RuntimeTypes.StaticChunkClimate getStaticClimateSample(ServerWorld world, ChunkPos chunkPos) {
+    public synchronized RuntimeTypes.StaticChunkClimate getStaticClimateSample(ServerLevel world, ChunkPos chunkPos) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        return region.staticClimateSamples.get(chunkPos.toLong());
+        return region.staticClimateSamples.get(chunkPos.pack());
     }
 
-    public synchronized boolean hasStaticClimateSample(ServerWorld world, ChunkPos chunkPos) {
+    public synchronized boolean hasStaticClimateSample(ServerLevel world, ChunkPos chunkPos) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        return region.staticClimateSamples.containsKey(chunkPos.toLong());
+        return region.staticClimateSamples.containsKey(chunkPos.pack());
     }
 
-    public synchronized void setChunkSeasonRule(ServerWorld world, ChunkPos chunkPos, RuntimeTypes.ChunkSeasonRule rule) {
+    public synchronized void setChunkSeasonRule(ServerLevel world, ChunkPos chunkPos, RuntimeTypes.ChunkSeasonRule rule) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        RuntimeTypes.ChunkSeasonRule current = region.chunkSeasonRules.get(chunkPos.toLong());
+        RuntimeTypes.ChunkSeasonRule current = region.chunkSeasonRules.get(chunkPos.pack());
         if (Objects.equals(current, rule)) return;
-        region.chunkSeasonRules.put(chunkPos.toLong(), rule);
+        region.chunkSeasonRules.put(chunkPos.pack(), rule);
         region.dirty = true;
         submitWriteIfDirty(region);
     }
 
-    public synchronized RuntimeTypes.ChunkSeasonRule getChunkSeasonRule(ServerWorld world, ChunkPos chunkPos) {
+    public synchronized RuntimeTypes.ChunkSeasonRule getChunkSeasonRule(ServerLevel world, ChunkPos chunkPos) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        return region.chunkSeasonRules.get(chunkPos.toLong());
+        return region.chunkSeasonRules.get(chunkPos.pack());
     }
 
-    public synchronized boolean hasChunkSeasonRule(ServerWorld world, ChunkPos chunkPos) {
+    public synchronized boolean hasChunkSeasonRule(ServerLevel world, ChunkPos chunkPos) {
         RegionData region = getOrSubmitLoad(world, chunkPos, true);
-        return region.chunkSeasonRules.containsKey(chunkPos.toLong());
+        return region.chunkSeasonRules.containsKey(chunkPos.pack());
     }
 
-    public synchronized void collectSnowyChunks(ServerWorld world, int epoch, Set<ChunkPos> out) {
+    public synchronized void collectSnowyChunks(ServerLevel world, int epoch, Set<ChunkPos> out) {
         int seasonIndex = SeasonCacheMod.get().seasonRuleConfig()
                 .seasonIndex(SeasonCacheMod.get().seasonProvider().snapshot(world).seasonKey());
-        String dimensionId = world.getRegistryKey().getValue().toString();
+        String dimensionId = world.dimension().identifier().toString();
         for (Map.Entry<RegionKey, RegionData> entry : this.loadedRegions.entrySet()) {
             if (!Objects.equals(entry.getKey().dimensionId, dimensionId)) continue;
             for (Map.Entry<Long, RuntimeTypes.ChunkSeasonRule> ruleEntry : entry.getValue().chunkSeasonRules.entrySet()) {
                 if (ruleEntry.getValue().isSnowyInSeason(seasonIndex)) {
-                    out.add(new ChunkPos(ruleEntry.getKey()));
+                    out.add(ChunkPos.unpack(ruleEntry.getKey()));
                 }
             }
         }
     }
 
-    public synchronized Boolean getCoverageSnowState(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
+    public synchronized Boolean getCoverageSnowState(ServerLevel world, ChunkPos chunkPos, int currentEpoch) {
         RuntimeTypes.ChunkSeasonRule rule = getChunkSeasonRule(world, chunkPos);
         if (rule == null) return null;
         int seasonIndex = SeasonCacheMod.get().seasonRuleConfig()
@@ -183,7 +183,7 @@ public final class ChunkSeasonStore {
         return rule.isSnowyInSeason(seasonIndex);
     }
 
-    public synchronized Boolean getAuthoritativeChunkSnowState(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
+    public synchronized Boolean getAuthoritativeChunkSnowState(ServerLevel world, ChunkPos chunkPos, int currentEpoch) {
         RuntimeTypes.ChunkSeasonRule rule = getChunkSeasonRule(world, chunkPos);
         if (rule == null) return null;
         int seasonIndex = SeasonCacheMod.get().seasonRuleConfig()
@@ -191,17 +191,17 @@ public final class ChunkSeasonStore {
         return rule.isSnowyInSeason(seasonIndex);
     }
 
-    public synchronized List<AuthoritativeChunkState> snapshotAuthoritativeChunkSnowStates(ServerWorld world, int currentEpoch) {
+    public synchronized List<AuthoritativeChunkState> snapshotAuthoritativeChunkSnowStates(ServerLevel world, int currentEpoch) {
         List<AuthoritativeChunkState> states = new ArrayList<>();
         int seasonIndex = SeasonCacheMod.get().seasonRuleConfig()
                 .seasonIndex(SeasonCacheMod.get().seasonProvider().snapshot(world).seasonKey());
-        String dimensionId = world.getRegistryKey().getValue().toString();
+        String dimensionId = world.dimension().identifier().toString();
 
         for (Map.Entry<RegionKey, RegionData> entry : this.loadedRegions.entrySet()) {
             if (!Objects.equals(entry.getKey().dimensionId, dimensionId)) continue;
             for (Map.Entry<Long, RuntimeTypes.ChunkSeasonRule> ruleEntry : entry.getValue().chunkSeasonRules.entrySet()) {
                 states.add(new AuthoritativeChunkState(
-                        new ChunkPos(ruleEntry.getKey()),
+                        ChunkPos.unpack(ruleEntry.getKey()),
                         ruleEntry.getValue().isSnowyInSeason(seasonIndex)
                 ));
             }
@@ -209,11 +209,11 @@ public final class ChunkSeasonStore {
         return states;
     }
 
-    public synchronized Boolean getChunkSnowState(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
+    public synchronized Boolean getChunkSnowState(ServerLevel world, ChunkPos chunkPos, int currentEpoch) {
         return getAuthoritativeChunkSnowState(world, chunkPos, currentEpoch);
     }
 
-    public synchronized void preWarmRegion(ServerWorld world, int regionX, int regionZ) {
+    public synchronized void preWarmRegion(ServerLevel world, int regionX, int regionZ) {
         getOrSubmitLoad(world, new ChunkPos(regionX * 32, regionZ * 32), false);
     }
 
@@ -234,7 +234,7 @@ public final class ChunkSeasonStore {
             inMemoryPaths.add(region.path);
         }
 
-        Path sidecarRoot = server.getSavePath(WorldSavePath.ROOT).resolve("seasoncache");
+        Path sidecarRoot = server.getWorldPath(LevelResource.ROOT).resolve("seasoncache");
         if (!Files.isDirectory(sidecarRoot)) return;
 
         List<Path> diskFiles = new ArrayList<>();
@@ -273,7 +273,7 @@ public final class ChunkSeasonStore {
             inMemoryPaths.add(region.path);
         }
 
-        Path sidecarRoot = server.getSavePath(WorldSavePath.ROOT).resolve("seasoncache");
+        Path sidecarRoot = server.getWorldPath(LevelResource.ROOT).resolve("seasoncache");
         if (!Files.isDirectory(sidecarRoot)) return;
 
         List<Path> diskFiles = new ArrayList<>();
@@ -333,10 +333,10 @@ public final class ChunkSeasonStore {
         }
     }
 
-    private RegionData getOrSubmitLoad(ServerWorld world, ChunkPos chunkPos, boolean isHighPriority) {
-        int regionX = Math.floorDiv(chunkPos.x, 32);
-        int regionZ = Math.floorDiv(chunkPos.z, 32);
-        String dimensionId = world.getRegistryKey().getValue().toString();
+    private RegionData getOrSubmitLoad(ServerLevel world, ChunkPos chunkPos, boolean isHighPriority) {
+        int regionX = Math.floorDiv(chunkPos.x(), 32);
+        int regionZ = Math.floorDiv(chunkPos.z(), 32);
+        String dimensionId = world.dimension().identifier().toString();
         RegionKey key = new RegionKey(dimensionId, regionX, regionZ);
 
         RegionData cached = this.loadedRegions.get(key);
@@ -551,9 +551,9 @@ public final class ChunkSeasonStore {
         }
     }
 
-    private static Path sidecarPath(ServerWorld world, int regionX, int regionZ) {
-        String dimPath = world.getRegistryKey().getValue().getPath();
-        return world.getServer().getSavePath(WorldSavePath.ROOT)
+    private static Path sidecarPath(ServerLevel world, int regionX, int regionZ) {
+        String dimPath = world.dimension().identifier().getPath();
+        return world.getServer().getWorldPath(LevelResource.ROOT)
                 .resolve("seasoncache")
                 .resolve(dimPath)
                 .resolve("r." + regionX + "." + regionZ + ".json");

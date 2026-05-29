@@ -1,6 +1,6 @@
 # Season Cache
 
-**Minecraft 1.21.x  |  Fabric  |  Requires Serene Seasons**
+**Minecraft 26.1.x  |  Fabric  |  Requires Serene Seasons**
 
 Season Cache keeps snow and ice blocks in sync with your Serene Seasons configuration. When winter arrives, snow and ice appear on terrain. When spring comes, they clear. It also builds and maintains a server-authoritative per-chunk snow coverage map that companion mods such as Nova Reimagined Snow can use to drive accurate shader snow in Distant Horizons LOD terrain.
 
@@ -16,10 +16,11 @@ It also solves the LOD snow problem. Distant Horizons renders terrain far beyond
 
 ## Requirements
 
-- Minecraft 1.21.x (Java Edition)
-- Fabric Loader 0.16.0 or later
-- Fabric API
-- Serene Seasons 10.x for 1.21.x
+- Minecraft 26.1, 26.1.1, or 26.1.2 (Java Edition)
+- Java 25
+- Fabric Loader 0.18.4 or later
+- Fabric API 0.150.0+ for 26.1.2
+- Serene Seasons 26.1.2.0.2+ for 26.1.2 (place matching jar in `libs/` to build from source)
 
 Optional but recommended:
 

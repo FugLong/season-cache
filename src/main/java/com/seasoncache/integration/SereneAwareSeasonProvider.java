@@ -2,11 +2,11 @@ package com.seasoncache.integration;
 
 import com.seasoncache.SeasonCacheMod;
 import com.seasoncache.core.RuntimeTypes;
-import net.minecraft.registry.entry.RegistryEntry;
-import net.minecraft.server.world.ServerWorld;
-import net.minecraft.util.Identifier;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.world.biome.Biome;
+import net.minecraft.core.Holder;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.resources.Identifier;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.biome.Biome;
 import sereneseasons.api.season.ISeasonState;
 import sereneseasons.api.season.SeasonHelper;
 import sereneseasons.season.SeasonHooks;
@@ -23,9 +23,9 @@ import java.util.Set;
  * Key SS API facts confirmed from jar inspection (10.1.0.1):
  *   SeasonHelper.getSeasonState(WorldAccess)            → ISeasonState
  *   ISeasonState.getSubSeason()                         → Season.SubSeason
- *   Season.SubSeason.asString()                → String
- *   SeasonHooks.hasPrecipitationSeasonal(World, RegistryEntry<Biome>) → boolean
- *   SeasonHooks.shouldSnow(LevelReader, RegistryEntry<Biome>, BlockPos) → boolean
+ *   Season.SubSeason.getSerializedName()                → String
+ *   SeasonHooks.hasPrecipitationSeasonal(World, Holder<Biome>) → boolean
+ *   SeasonHooks.shouldSnow(LevelReader, Holder<Biome>, BlockPos) → boolean
  *   Biome.canSetIce intercepted by SS MixinBiome automatically
  */
 public final class SereneAwareSeasonProvider implements SeasonProvider {
@@ -38,9 +38,9 @@ public final class SereneAwareSeasonProvider implements SeasonProvider {
     }
 
     @Override
-    public RuntimeTypes.SeasonSnapshot snapshot(ServerWorld world) {
+    public RuntimeTypes.SeasonSnapshot snapshot(ServerLevel world) {
         ISeasonState state = SeasonHelper.getSeasonState(world);
-        String key = state.getSubSeason().asString();
+        String key = state.getSubSeason().getSerializedName();
         return new RuntimeTypes.SeasonSnapshot(PROVIDER_ID, key);
     }
 
@@ -61,25 +61,25 @@ public final class SereneAwareSeasonProvider implements SeasonProvider {
      * picked up automatically with no code changes required.
      */
     @Override
-    public Set<Identifier> buildSeasonalOverrideSet(ServerWorld world,
-            Iterable<? extends RegistryEntry<Biome>> allBiomes) {
+    public Set<Identifier> buildSeasonalOverrideSet(ServerLevel world,
+            Iterable<? extends Holder<Biome>> allBiomes) {
         Set<Identifier> overrides = new HashSet<>();
         int scanned = 0;
         int overrideCount = 0;
 
-        for (RegistryEntry<Biome> biomeEntry : allBiomes) {
+        for (Holder<Biome> biomeEntry : allBiomes) {
             scanned++;
             Biome biome = biomeEntry.value();
 
             // Only examine biomes that would be classified PERENNIAL_COLD by temperature.
             // Above-threshold biomes are already SEASONAL_TEMPORARY — no override needed.
-            if (!biome.hasPrecipitation() || biome.getTemperature() >= PERENNIAL_COLD_THRESHOLD) {
+            if (!biome.hasPrecipitation() || biome.getBaseTemperature() >= PERENNIAL_COLD_THRESHOLD) {
                 continue;
             }
 
             try {
                 if (SeasonHooks.hasPrecipitationSeasonal(world, biomeEntry)) {
-                    biomeEntry.getKey().ifPresent(key -> overrides.add(key.getValue()));
+                    biomeEntry.unwrapKey().ifPresent(key -> overrides.add(key.identifier()));
                     overrideCount++;
                 }
             } catch (Exception e) {
@@ -88,7 +88,7 @@ public final class SereneAwareSeasonProvider implements SeasonProvider {
                 SeasonCacheMod.LOGGER.warn(
                     "Season Cache: failed to query hasPrecipitationSeasonal for biome {}, " +
                     "treating as perennial cold.",
-                    biomeEntry.getKey().map(k -> k.getValue().toString()).orElse("unknown"), e);
+                    biomeEntry.unwrapKey().map(k -> k.identifier().toString()).orElse("unknown"), e);
             }
         }
 
@@ -133,19 +133,19 @@ public final class SereneAwareSeasonProvider implements SeasonProvider {
      * Fails safe to true (keep snow) on any exception.
      */
     @Override
-    public boolean isSnowSeason(ServerWorld world) {
+    public boolean isSnowSeason(ServerLevel world) {
         try {
             ISeasonState state = SeasonHelper.getSeasonState(world);
-            return state.getSubSeason().asString().contains("winter");
+            return state.getSubSeason().getSerializedName().contains("winter");
         } catch (Exception e) {
             return true;
         }
     }
 
     @Override
-    public float sampleSeasonalTemperature(ServerWorld world, BlockPos pos,
-            RegistryEntry<Biome> biomeEntry) {
-        return SeasonHooks.getBiomeTemperature(world, biomeEntry, pos);
+    public float sampleSeasonalTemperature(ServerLevel world, BlockPos pos,
+            Holder<Biome> biomeEntry) {
+        return SeasonHooks.getBiomeTemperature(world, biomeEntry, pos, world.getSeaLevel());
     }
 
     /**
@@ -168,18 +168,18 @@ public final class SereneAwareSeasonProvider implements SeasonProvider {
      * @param seasonalColdOverrides built once at server start, O(1) lookup here
      */
     @Override
-    public RuntimeTypes.ColumnType classifyColumn(ServerWorld world, BlockPos pos,
-            RegistryEntry<Biome> biomeEntry, Set<Identifier> seasonalColdOverrides) {
+    public RuntimeTypes.ColumnType classifyColumn(ServerLevel world, BlockPos pos,
+            Holder<Biome> biomeEntry, Set<Identifier> seasonalColdOverrides) {
         Biome biome = biomeEntry.value();
 
         if (!biome.hasPrecipitation()) {
             return RuntimeTypes.ColumnType.NON_SEASONAL;
         }
 
-        if (biome.getTemperature() < PERENNIAL_COLD_THRESHOLD) {
+        if (biome.getBaseTemperature() < PERENNIAL_COLD_THRESHOLD) {
             // Check if SS overrides this biome to be seasonal despite the cold temperature.
-            boolean isSeasonalOverride = biomeEntry.getKey()
-                    .map(key -> seasonalColdOverrides.contains(key.getValue()))
+            boolean isSeasonalOverride = biomeEntry.unwrapKey()
+                    .map(key -> seasonalColdOverrides.contains(key.identifier()))
                     .orElse(false);
 
             return isSeasonalOverride
@@ -207,12 +207,12 @@ public final class SereneAwareSeasonProvider implements SeasonProvider {
      * Only called on cold-cache chunks; results stored in the climate bit cache.
      */
     @Override
-    public boolean shouldHaveSnowNow(ServerWorld world, BlockPos pos,
-            RegistryEntry<Biome> biomeEntry, boolean isSnowSeason, int epoch, float bandWidth) {
-        if (!isSnowSeason && biomeEntry.value().getTemperature() >= PERENNIAL_COLD_THRESHOLD) {
+    public boolean shouldHaveSnowNow(ServerLevel world, BlockPos pos,
+            Holder<Biome> biomeEntry, boolean isSnowSeason, int epoch, float bandWidth) {
+        if (!isSnowSeason && biomeEntry.value().getBaseTemperature() >= PERENNIAL_COLD_THRESHOLD) {
             return false;
         }
-        float adjustedTemp = SeasonHooks.getBiomeTemperature(world, biomeEntry, pos);
+        float adjustedTemp = SeasonHooks.getBiomeTemperature(world, biomeEntry, pos, world.getSeaLevel());
         return resolveWithHysteresis(adjustedTemp, pos.getX(), pos.getZ(), epoch,
                 world.getSeed(), bandWidth);
     }
@@ -225,12 +225,12 @@ public final class SereneAwareSeasonProvider implements SeasonProvider {
      * Only called on cold-cache chunks; results stored in the climate bit cache.
      */
     @Override
-    public boolean shouldHaveIceNow(ServerWorld world, BlockPos pos,
-            RegistryEntry<Biome> biomeEntry, boolean isSnowSeason, int epoch, float bandWidth) {
-        if (!isSnowSeason && biomeEntry.value().getTemperature() >= PERENNIAL_COLD_THRESHOLD) {
+    public boolean shouldHaveIceNow(ServerLevel world, BlockPos pos,
+            Holder<Biome> biomeEntry, boolean isSnowSeason, int epoch, float bandWidth) {
+        if (!isSnowSeason && biomeEntry.value().getBaseTemperature() >= PERENNIAL_COLD_THRESHOLD) {
             return false;
         }
-        float adjustedTemp = SeasonHooks.getBiomeTemperature(world, biomeEntry, pos);
+        float adjustedTemp = SeasonHooks.getBiomeTemperature(world, biomeEntry, pos, world.getSeaLevel());
         return resolveWithHysteresis(adjustedTemp, pos.getX(), pos.getZ(), epoch,
                 world.getSeed(), bandWidth);
     }

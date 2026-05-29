@@ -1,9 +1,9 @@
 package com.seasoncache;
 
-import net.minecraft.block.Block;
-import net.minecraft.registry.RegistryKeys;
-import net.minecraft.registry.tag.TagKey;
-import net.minecraft.util.Identifier;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.tags.TagKey;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.block.Block;
 
 /**
  * Block tag keys defined by this mod.
@@ -30,8 +30,8 @@ public final class ModTags {
      *
      * To replace: use "replace": true to discard the defaults and supply your own full list.
      */
-    public static final TagKey<Block> SNOW_PLACEMENT_BLACKLIST = TagKey.of(
-            RegistryKeys.BLOCK,
-            Identifier.of("seasoncache", "snow_placement_blacklist")
+    public static final TagKey<Block> SNOW_PLACEMENT_BLACKLIST = TagKey.create(
+            Registries.BLOCK,
+            Identifier.fromNamespaceAndPath("seasoncache", "snow_placement_blacklist")
     );
 }

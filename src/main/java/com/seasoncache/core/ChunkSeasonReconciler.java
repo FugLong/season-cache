@@ -5,20 +5,21 @@ import com.seasoncache.config.SeasonCacheConfig;
 import com.seasoncache.core.store.ChunkSeasonStore;
 import com.seasoncache.integration.SeasonProvider;
 import com.seasoncache.ModTags;
-import net.minecraft.block.Block;
-import net.minecraft.block.BlockState;
-import net.minecraft.block.Blocks;
-import net.minecraft.fluid.FluidState;
-import net.minecraft.fluid.Fluids;
-import net.minecraft.registry.RegistryKey;
-import net.minecraft.registry.RegistryKeys;
-import net.minecraft.registry.entry.RegistryEntry;
-import net.minecraft.server.world.ServerWorld;
-import net.minecraft.util.Identifier;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.ChunkPos;
-import net.minecraft.world.Heightmap;
-import net.minecraft.world.biome.Biome;
+import net.minecraft.core.Direction;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.world.level.block.Block;
+import net.minecraft.world.level.block.state.BlockState;
+import net.minecraft.world.level.block.Blocks;
+import net.minecraft.world.level.material.FluidState;
+import net.minecraft.world.level.material.Fluids;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.core.Holder;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.resources.Identifier;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.biome.Biome;
 import sereneseasons.api.season.Season;
 import sereneseasons.season.SeasonHooks;
 
@@ -49,7 +50,7 @@ public final class ChunkSeasonReconciler {
         this.store = store;
     }
 
-    public void reconcile(ServerWorld world, ChunkPos chunkPos) {
+    public void reconcile(ServerLevel world, ChunkPos chunkPos) {
         int currentEpoch = this.epochService.currentEpoch(world);
         if (this.store.isChunkClean(world, chunkPos, currentEpoch)) return;
 
@@ -77,16 +78,16 @@ public final class ChunkSeasonReconciler {
         SeasonCacheMod.get().onChunkAuthoritativelyReconciled(world, chunkPos, currentEpoch);
     }
 
-    public boolean prepareChunkRule(ServerWorld world, ChunkPos chunkPos) {
+    public boolean prepareChunkRule(ServerLevel world, ChunkPos chunkPos) {
         return ensureChunkSeasonRule(world, chunkPos) != null;
     }
 
-    private int currentSeasonIndex(ServerWorld world) {
+    private int currentSeasonIndex(ServerLevel world) {
         String seasonKey = this.provider.snapshot(world).seasonKey();
         return SeasonCacheMod.get().seasonRuleConfig().seasonIndex(seasonKey);
     }
 
-    private RuntimeTypes.ChunkSeasonRule ensureChunkSeasonRule(ServerWorld world, ChunkPos chunkPos) {
+    private RuntimeTypes.ChunkSeasonRule ensureChunkSeasonRule(ServerLevel world, ChunkPos chunkPos) {
         RuntimeTypes.ChunkSeasonRule cachedRule = this.store.getChunkSeasonRule(world, chunkPos);
         if (cachedRule != null) return cachedRule;
 
@@ -103,46 +104,48 @@ public final class ChunkSeasonReconciler {
         return rule;
     }
 
-    private RuntimeTypes.StaticChunkClimate createStaticClimateSample(ServerWorld world, ChunkPos chunkPos) {
-        int worldX = chunkPos.getStartX() + 8;
-        int worldZ = chunkPos.getStartZ() + 8;
-        int surfaceY = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, worldX, worldZ) - 1;
-        surfaceY = Math.max(surfaceY, world.getBottomY());
+    private RuntimeTypes.StaticChunkClimate createStaticClimateSample(ServerLevel world, ChunkPos chunkPos) {
+        int worldX = chunkPos.getMinBlockX() + 8;
+        int worldZ = chunkPos.getMinBlockZ() + 8;
+        int surfaceY = world.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, worldX, worldZ) - 1;
+        surfaceY = Math.max(surfaceY, world.getMinY());
         BlockPos samplePos = new BlockPos(worldX, surfaceY, worldZ);
-        RegistryEntry<Biome> biomeEntry = world.getBiome(samplePos);
-        String biomeId = biomeEntry.getKey().map(key -> key.getValue().toString()).orElse(null);
+        Holder<Biome> biomeEntry = world.getBiome(samplePos);
+        String biomeId = biomeEntry.unwrapKey().map(key -> key.identifier().toString()).orElse(null);
         if (biomeId == null || biomeId.isBlank()) return null;
         return new RuntimeTypes.StaticChunkClimate(biomeId, surfaceY);
     }
 
     private RuntimeTypes.ChunkSeasonRule buildChunkSeasonRule(
-            ServerWorld world,
+            ServerLevel world,
             ChunkPos chunkPos,
             RuntimeTypes.StaticChunkClimate staticSample
     ) {
-        int worldX = chunkPos.getStartX() + 8;
-        int worldZ = chunkPos.getStartZ() + 8;
-        BlockPos samplePos = new BlockPos(worldX, Math.max(staticSample.surfaceY(), world.getBottomY()), worldZ);
+        int worldX = chunkPos.getMinBlockX() + 8;
+        int worldZ = chunkPos.getMinBlockZ() + 8;
+        BlockPos samplePos = new BlockPos(worldX, Math.max(staticSample.surfaceY(), world.getMinY()), worldZ);
 
-        RegistryEntry<Biome> biomeEntry = resolveBiomeEntry(world, staticSample.biomeId());
+        Holder<Biome> biomeEntry = resolveBiomeEntry(world, staticSample.biomeId());
         if (biomeEntry == null) {
             biomeEntry = world.getBiome(samplePos);
         }
 
-        return buildChunkSeasonRule(samplePos, biomeEntry, SeasonCacheMod.get().seasonRuleConfig());
+        return buildChunkSeasonRule(samplePos, biomeEntry, SeasonCacheMod.get().seasonRuleConfig(), world.getSeaLevel());
     }
 
     public static RuntimeTypes.ChunkSeasonRule buildChunkSeasonRule(
             BlockPos samplePos,
-            RegistryEntry<Biome> biomeEntry,
-            RuntimeTypes.SeasonRuleConfig ruleConfig
+            Holder<Biome> biomeEntry,
+            RuntimeTypes.SeasonRuleConfig ruleConfig,
+            int seaLevel
     ) {
         int mask = 0;
         if (ruleConfig.generateSnowIce() && biomeEntry.value().hasPrecipitation()) {
             Season.SubSeason[] subSeasons = Season.SubSeason.values();
             int limit = Math.min(12, subSeasons.length);
             for (int i = 0; i < limit; i++) {
-                float seasonTemp = SeasonHooks.getBiomeTemperatureInSeason(subSeasons[i], biomeEntry, samplePos);
+                float seasonTemp = SeasonHooks.getBiomeTemperatureInSeason(
+                        subSeasons[i], biomeEntry, samplePos, seaLevel);
                 if (seasonTemp < SNOW_FREEZE_THRESHOLD) {
                     mask |= (1 << i);
                 }
@@ -153,49 +156,50 @@ public final class ChunkSeasonReconciler {
         return new RuntimeTypes.ChunkSeasonRule(mask, perennial);
     }
 
-    private RegistryEntry<Biome> resolveBiomeEntry(ServerWorld world, String biomeId) {
+    private Holder<Biome> resolveBiomeEntry(ServerLevel world, String biomeId) {
         if (biomeId == null || biomeId.isBlank()) return null;
         try {
-            Identifier id = Identifier.of(biomeId);
-            var biomeRegistry = world.getRegistryManager().get(RegistryKeys.BIOME);
-            return biomeRegistry.getEntry(RegistryKey.of(RegistryKeys.BIOME, id)).orElse(null);
+            Identifier id = Identifier.parse(biomeId);
+            return world.registryAccess().lookupOrThrow(Registries.BIOME)
+                    .get(ResourceKey.create(Registries.BIOME, id))
+                    .orElse(null);
         } catch (Exception ignored) {
             return null;
         }
     }
 
-    private void applyChunkTruth(ServerWorld world, ChunkPos chunkPos, boolean snowy) {
-        int bottomY = world.getBottomY();
-        BlockPos.Mutable pos = new BlockPos.Mutable();
+    private void applyChunkTruth(ServerLevel world, ChunkPos chunkPos, boolean snowy) {
+        int bottomY = world.getMinY();
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
 
         // Removal is surface-only, symmetric with placement. Scanning all sections
         // would destroy snow inside buildings, on tree decorations, and in structures.
         // The heightmap gives us the exact surface layer where seasonal snow lives.
         for (int localZ = 0; localZ < 16; localZ++) {
             for (int localX = 0; localX < 16; localX++) {
-                int worldX = chunkPos.getStartX() + localX;
-                int worldZ = chunkPos.getStartZ() + localZ;
+                int worldX = chunkPos.getMinBlockX() + localX;
+                int worldZ = chunkPos.getMinBlockZ() + localZ;
                 // getTopY returns the first air block above the surface, so topY-1 is the
                 // surface block (e.g. grass). Snow layers sit ON TOP of the surface at topY,
                 // and ice replaces the surface block at topY-1. Check both positions so we
                 // catch snow regardless of whether it is included in the heightmap or not.
-                int surfaceY = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, worldX, worldZ) - 1;
+                int surfaceY = world.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, worldX, worldZ) - 1;
                 if (surfaceY < bottomY) continue;
 
                 if (!snowy) {
                     // Check topY (snow on top of surface)
                     pos.set(worldX, surfaceY + 1, worldZ);
                     BlockState above = world.getBlockState(pos);
-                    if (this.config.trackSnow && above.isOf(Blocks.SNOW)) {
-                        world.setBlockState(pos, Blocks.AIR.getDefaultState(), Block.NOTIFY_LISTENERS);
+                    if (this.config.trackSnow && above.is(Blocks.SNOW)) {
+                        world.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
                     }
                     // Check topY-1 (ice in place of surface block, or snow if heightmap included it)
                     pos.set(worldX, surfaceY, worldZ);
                     BlockState surface = world.getBlockState(pos);
-                    if (this.config.trackSnow && surface.isOf(Blocks.SNOW)) {
-                        world.setBlockState(pos, Blocks.AIR.getDefaultState(), Block.NOTIFY_LISTENERS);
-                    } else if (this.config.trackIce && surface.isOf(Blocks.ICE)) {
-                        world.setBlockState(pos, Blocks.WATER.getDefaultState(), Block.NOTIFY_LISTENERS);
+                    if (this.config.trackSnow && surface.is(Blocks.SNOW)) {
+                        world.setBlock(pos, Blocks.AIR.defaultBlockState(), 3);
+                    } else if (this.config.trackIce && surface.is(Blocks.ICE)) {
+                        world.setBlock(pos, Blocks.WATER.defaultBlockState(), 3);
                     }
                 }
             }
@@ -206,16 +210,16 @@ public final class ChunkSeasonReconciler {
         }
     }
 
-    private void placeSnowAndIce(ServerWorld world, ChunkPos chunkPos, int bottomY) {
-        BlockPos.Mutable pos = new BlockPos.Mutable();
-        BlockPos.Mutable abovePos = new BlockPos.Mutable();
+    private void placeSnowAndIce(ServerLevel world, ChunkPos chunkPos, int bottomY) {
+        BlockPos.MutableBlockPos pos = new BlockPos.MutableBlockPos();
+        BlockPos.MutableBlockPos abovePos = new BlockPos.MutableBlockPos();
 
         for (int localZ = 0; localZ < 16; localZ++) {
             for (int localX = 0; localX < 16; localX++) {
-                int worldX = chunkPos.getStartX() + localX;
-                int worldZ = chunkPos.getStartZ() + localZ;
+                int worldX = chunkPos.getMinBlockX() + localX;
+                int worldZ = chunkPos.getMinBlockZ() + localZ;
 
-                int topY = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,
+                int topY = world.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
                         worldX, worldZ) - 1;
                 if (topY < bottomY) continue;
 
@@ -224,13 +228,13 @@ public final class ChunkSeasonReconciler {
 
                 if (this.config.trackSnow) {
                     BlockState aboveState = world.getBlockState(abovePos);
-                    if (aboveState.isAir() && world.isSkyVisible(abovePos)) {
+                    if (aboveState.isAir() && world.canSeeSkyFromBelowWater(abovePos)) {
                         BlockState surfaceState = world.getBlockState(pos);
-                        if (surfaceState.isFullCube(world, pos)
-                                && !surfaceState.isIn(ModTags.SNOW_PLACEMENT_BLACKLIST)
-                                && Blocks.SNOW.getDefaultState().canPlaceAt(world, abovePos)) {
-                            world.setBlockState(abovePos, Blocks.SNOW.getDefaultState(),
-                                    Block.NOTIFY_LISTENERS);
+                        if (surfaceState.isFaceSturdy(world, pos, Direction.UP)
+                                && !surfaceState.is(ModTags.SNOW_PLACEMENT_BLACKLIST)
+                                && Blocks.SNOW.defaultBlockState().canSurvive(world, abovePos)) {
+                            world.setBlock(abovePos, Blocks.SNOW.defaultBlockState(),
+                                    3);
                         }
                     }
                 }
@@ -238,22 +242,22 @@ public final class ChunkSeasonReconciler {
                 if (this.config.trackIce) {
                     BlockState surfaceState = world.getBlockState(pos);
                     FluidState fluid = surfaceState.getFluidState();
-                    if (!fluid.isEmpty() && fluid.isStill()
-                            && fluid.getFluid() == Fluids.WATER
+                    if (!fluid.isEmpty() && fluid.isSource()
+                            && fluid.getType() == Fluids.WATER
                             && isShorelineAdjacent(world, pos)) {
-                        world.setBlockState(pos, Blocks.ICE.getDefaultState(),
-                                Block.NOTIFY_LISTENERS);
+                        world.setBlock(pos, Blocks.ICE.defaultBlockState(),
+                                3);
                     }
                 }
             }
         }
     }
 
-    private static boolean isShorelineAdjacent(ServerWorld world, BlockPos waterPos) {
+    private static boolean isShorelineAdjacent(ServerLevel world, BlockPos waterPos) {
         int x = waterPos.getX();
         int y = waterPos.getY();
         int z = waterPos.getZ();
-        BlockPos.Mutable check = new BlockPos.Mutable();
+        BlockPos.MutableBlockPos check = new BlockPos.MutableBlockPos();
 
         check.set(x + 1, y, z); if (isSolidLand(world.getBlockState(check))) return true;
         check.set(x - 1, y, z); if (isSolidLand(world.getBlockState(check))) return true;
@@ -266,8 +270,8 @@ public final class ChunkSeasonReconciler {
     private static boolean isSolidLand(BlockState state) {
         if (state.isAir()) return false;
         if (!state.getFluidState().isEmpty()) return false;
-        if (state.isOf(Blocks.ICE) || state.isOf(Blocks.PACKED_ICE)
-                || state.isOf(Blocks.BLUE_ICE)) return false;
+        if (state.is(Blocks.ICE) || state.is(Blocks.PACKED_ICE)
+                || state.is(Blocks.BLUE_ICE)) return false;
         return true;
     }
 }

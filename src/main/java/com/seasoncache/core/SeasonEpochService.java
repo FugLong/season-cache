@@ -2,7 +2,7 @@ package com.seasoncache.core;
 
 import com.seasoncache.config.SeasonCacheConfig;
 import com.seasoncache.integration.SeasonProvider;
-import net.minecraft.server.world.ServerWorld;
+import net.minecraft.server.level.ServerLevel;
 
 import java.util.Objects;
 
@@ -28,7 +28,7 @@ public final class SeasonEpochService {
         this.seasonProvider = seasonProvider;
     }
 
-    public int currentEpoch(ServerWorld world) {
+    public int currentEpoch(ServerLevel world) {
         RuntimeTypes.SeasonSnapshot snapshot = this.seasonProvider.snapshot(world);
         return Objects.hash(
                 this.sessionSalt,

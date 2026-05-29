@@ -14,16 +14,16 @@ public final class SeasonCacheClient implements ClientModInitializer {
     public void onInitializeClient() {
         SeasonCacheNetworking.registerPayloadTypes();
 
-        ClientPlayNetworking.registerGlobalReceiver(SnapshotBeginPayload.ID, (payload, context) ->
+        ClientPlayNetworking.registerGlobalReceiver(SnapshotBeginPayload.TYPE, (payload, context) ->
                 SeasonCacheClientState.beginSnapshot(payload.dimensionId(), payload.epoch()));
 
-        ClientPlayNetworking.registerGlobalReceiver(ChunkStatesPayload.ID, (payload, context) ->
+        ClientPlayNetworking.registerGlobalReceiver(ChunkStatesPayload.TYPE, (payload, context) ->
                 SeasonCacheClientState.applyChunkBatch(payload.dimensionId(), payload.epoch(), payload.packedChunkStates()));
 
-        ClientPlayNetworking.registerGlobalReceiver(SnapshotEndPayload.ID, (payload, context) ->
+        ClientPlayNetworking.registerGlobalReceiver(SnapshotEndPayload.TYPE, (payload, context) ->
                 SeasonCacheClientState.endSnapshot(payload.dimensionId(), payload.epoch()));
 
-        ClientPlayNetworking.registerGlobalReceiver(EpochInvalidatePayload.ID, (payload, context) ->
+        ClientPlayNetworking.registerGlobalReceiver(EpochInvalidatePayload.TYPE, (payload, context) ->
                 SeasonCacheClientState.applyInvalidate(payload.dimensionId(), payload.epoch()));
 
         ClientPlayConnectionEvents.DISCONNECT.register((handler, client) -> SeasonCacheClientState.resetAll());

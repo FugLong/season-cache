@@ -8,12 +8,12 @@ import com.seasoncache.network.payload.EpochInvalidatePayload;
 import com.seasoncache.network.payload.SnapshotBeginPayload;
 import com.seasoncache.network.payload.SnapshotEndPayload;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayNetworking;
-import net.minecraft.registry.RegistryKey;
+import net.minecraft.resources.ResourceKey;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.server.world.ServerWorld;
-import net.minecraft.util.math.ChunkPos;
-import net.minecraft.world.World;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.Level;
 
 import java.util.ArrayDeque;
 import java.util.ArrayList;
@@ -44,18 +44,18 @@ public final class SeasonCacheSyncManager {
         this.store = store;
     }
 
-    public void removePlayer(ServerPlayerEntity player) {
-        this.playerStates.remove(player.getUuid());
+    public void removePlayer(ServerPlayer player) {
+        this.playerStates.remove(player.getUUID());
     }
 
-    public void scheduleInitialSnapshot(ServerPlayerEntity player, int currentEpoch) {
-        if (player.getWorld().getRegistryKey() != World.OVERWORLD) return;
-        if (!ServerPlayNetworking.canSend(player, SnapshotBeginPayload.ID)) return;
+    public void scheduleInitialSnapshot(ServerPlayer player, int currentEpoch) {
+        if (player.level().dimension() != Level.OVERWORLD) return;
+        if (!ServerPlayNetworking.canSend(player, SnapshotBeginPayload.TYPE)) return;
 
-        ChunkPos origin = player.getChunkPos();
-        PlayerSyncState state = this.playerStates.computeIfAbsent(player.getUuid(), ignored -> new PlayerSyncState());
+        ChunkPos origin = player.chunkPosition();
+        PlayerSyncState state = this.playerStates.computeIfAbsent(player.getUUID(), ignored -> new PlayerSyncState());
         state.playerOrigin = origin;
-        state.snapshotPending = buildSnapshotEntries((ServerWorld) player.getWorld(), currentEpoch, origin);
+        state.snapshotPending = buildSnapshotEntries((ServerLevel) player.level(), currentEpoch, origin);
         state.snapshotEpoch = currentEpoch;
         state.snapshotRequested = true;
         state.snapshotStarted = false;
@@ -63,17 +63,17 @@ public final class SeasonCacheSyncManager {
         state.deltaPending.clear();
     }
 
-    public void broadcastEpochInvalidate(MinecraftServer server, RegistryKey<World> dimension, int newEpoch) {
-        ServerWorld world = server.getWorld(dimension);
+    public void broadcastEpochInvalidate(MinecraftServer server, ResourceKey<Level> dimension, int newEpoch) {
+        ServerLevel world = server.getLevel(dimension);
         if (world == null) return;
 
-        for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-            if (player.getWorld().getRegistryKey() != dimension) continue;
-            if (!ServerPlayNetworking.canSend(player, EpochInvalidatePayload.ID)) continue;
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (player.level().dimension() != dimension) continue;
+            if (!ServerPlayNetworking.canSend(player, EpochInvalidatePayload.TYPE)) continue;
 
-            ServerPlayNetworking.send(player, new EpochInvalidatePayload(world.getRegistryKey().getValue(), newEpoch));
+            ServerPlayNetworking.send(player, new EpochInvalidatePayload(world.dimension().identifier(), newEpoch));
 
-            PlayerSyncState state = this.playerStates.computeIfAbsent(player.getUuid(), ignored -> new PlayerSyncState());
+            PlayerSyncState state = this.playerStates.computeIfAbsent(player.getUUID(), ignored -> new PlayerSyncState());
             state.snapshotPending.clear();
             state.deltaPending.clear();
             state.snapshotRequested = false;
@@ -83,41 +83,41 @@ public final class SeasonCacheSyncManager {
         }
     }
 
-    public void queueChunkStateUpdate(ServerWorld world, ChunkPos chunkPos, int currentEpoch, boolean snowy) {
-        long packed = ChunkStatePacking.packChunkState(chunkPos.x, chunkPos.z, snowy);
+    public void queueChunkStateUpdate(ServerLevel world, ChunkPos chunkPos, int currentEpoch, boolean snowy) {
+        long packed = ChunkStatePacking.packChunkState(chunkPos.x(), chunkPos.z(), snowy);
         for (PlayerSyncState state : this.playerStates.values()) {
-            state.deltaPending.addLast(new PendingChunkState(world.getRegistryKey(), currentEpoch, packed));
+            state.deltaPending.addLast(new PendingChunkState(world.dimension(), currentEpoch, packed));
         }
     }
 
     public void tick(MinecraftServer server) {
-        for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-            PlayerSyncState state = this.playerStates.get(player.getUuid());
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            PlayerSyncState state = this.playerStates.get(player.getUUID());
             if (state == null) continue;
-            if (player.getWorld().getRegistryKey() != World.OVERWORLD) continue;
-            if (!ServerPlayNetworking.canSend(player, SnapshotBeginPayload.ID)) continue;
+            if (player.level().dimension() != Level.OVERWORLD) continue;
+            if (!ServerPlayNetworking.canSend(player, SnapshotBeginPayload.TYPE)) continue;
 
             sendSnapshotBatches(player, state);
             sendDeltaBatches(player, state);
         }
     }
 
-    private void sendSnapshotBatches(ServerPlayerEntity player, PlayerSyncState state) {
+    private void sendSnapshotBatches(ServerPlayer player, PlayerSyncState state) {
         if (state.snapshotRequested) {
             if (!state.snapshotStarted) {
-                ServerPlayNetworking.send(player, new SnapshotBeginPayload(World.OVERWORLD.getValue(), state.snapshotEpoch));
+                ServerPlayNetworking.send(player, new SnapshotBeginPayload(Level.OVERWORLD.identifier(), state.snapshotEpoch));
                 state.snapshotStarted = true;
             }
 
             int packetsSent = 0;
             while (!state.snapshotPending.isEmpty() && packetsSent < MAX_CHUNK_PACKETS_PER_TICK) {
                 long[] batch = drainChunkStateBatch(state.snapshotPending);
-                ServerPlayNetworking.send(player, new ChunkStatesPayload(World.OVERWORLD.getValue(), state.snapshotEpoch, batch));
+                ServerPlayNetworking.send(player, new ChunkStatesPayload(Level.OVERWORLD.identifier(), state.snapshotEpoch, batch));
                 packetsSent++;
             }
 
             if (state.snapshotPending.isEmpty() && !state.snapshotFinished) {
-                ServerPlayNetworking.send(player, new SnapshotEndPayload(World.OVERWORLD.getValue(), state.snapshotEpoch));
+                ServerPlayNetworking.send(player, new SnapshotEndPayload(Level.OVERWORLD.identifier(), state.snapshotEpoch));
                 state.snapshotFinished = true;
                 state.snapshotRequested = false;
                 sortDeltasByOrigin(state);
@@ -125,13 +125,13 @@ public final class SeasonCacheSyncManager {
         }
     }
 
-    private void sendDeltaBatches(ServerPlayerEntity player, PlayerSyncState state) {
+    private void sendDeltaBatches(ServerPlayer player, PlayerSyncState state) {
         int packetsSent = 0;
         while (!state.deltaPending.isEmpty() && packetsSent < MAX_CHUNK_PACKETS_PER_TICK) {
             PendingChunkState head = state.deltaPending.peekFirst();
             if (head == null) return;
 
-            if (player.getWorld().getRegistryKey() != head.dimension()) {
+            if (player.level().dimension() != head.dimension()) {
                 return;
             }
 
@@ -150,7 +150,7 @@ public final class SeasonCacheSyncManager {
             for (int i = 0; i < batchValues.size(); i++) {
                 packed[i] = batchValues.get(i);
             }
-            ServerPlayNetworking.send(player, new ChunkStatesPayload(head.dimension().getValue(), epoch, packed));
+            ServerPlayNetworking.send(player, new ChunkStatesPayload(head.dimension().identifier(), epoch, packed));
             packetsSent++;
         }
     }
@@ -177,12 +177,12 @@ public final class SeasonCacheSyncManager {
     }
 
     private static long deltaDistanceSq(long packed, ChunkPos origin) {
-        long dx = (long) ChunkStatePacking.unpackChunkX(packed) - origin.x;
-        long dz = (long) ChunkStatePacking.unpackChunkZ(packed) - origin.z;
+        long dx = (long) ChunkStatePacking.unpackChunkX(packed) - origin.x();
+        long dz = (long) ChunkStatePacking.unpackChunkZ(packed) - origin.z();
         return dx * dx + dz * dz;
     }
 
-    private ArrayDeque<Long> buildSnapshotEntries(ServerWorld world, int currentEpoch, ChunkPos origin) {
+    private ArrayDeque<Long> buildSnapshotEntries(ServerLevel world, int currentEpoch, ChunkPos origin) {
         ArrayDeque<Long> entries = new ArrayDeque<>();
 
         List<ChunkSeasonStore.AuthoritativeChunkState> states =
@@ -191,17 +191,17 @@ public final class SeasonCacheSyncManager {
 
         for (ChunkSeasonStore.AuthoritativeChunkState state : states) {
             ChunkPos chunkPos = state.chunkPos();
-            entries.addLast(ChunkStatePacking.packChunkState(chunkPos.x, chunkPos.z, state.snowy()));
+            entries.addLast(ChunkStatePacking.packChunkState(chunkPos.x(), chunkPos.z(), state.snowy()));
         }
 
         SeasonCacheMod.LOGGER.info("Season Cache sync: prepared player-prioritized snapshot of {} authoritative chunk states for {} at epoch {} from origin [{}, {}].",
-                entries.size(), world.getRegistryKey().getValue(), currentEpoch, origin.x, origin.z);
+                entries.size(), world.dimension().identifier(), currentEpoch, origin.x(), origin.z());
         return entries;
     }
 
     private static long distanceSq(ChunkPos pos, ChunkPos origin) {
-        long dx = (long) pos.x - origin.x;
-        long dz = (long) pos.z - origin.z;
+        long dx = (long) pos.x() - origin.x();
+        long dz = (long) pos.z() - origin.z();
         return dx * dx + dz * dz;
     }
 
@@ -227,6 +227,6 @@ public final class SeasonCacheSyncManager {
         private ChunkPos playerOrigin = null;
     }
 
-    private record PendingChunkState(RegistryKey<World> dimension, int epoch, long packedChunkState) {
+    private record PendingChunkState(ResourceKey<Level> dimension, int epoch, long packedChunkState) {
     }
 }

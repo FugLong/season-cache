@@ -6,17 +6,17 @@ import com.seasoncache.config.SeasonCacheConfig;
 import com.seasoncache.core.io.RegionIOThread;
 import com.seasoncache.core.store.ChunkSeasonStore;
 import com.seasoncache.integration.SeasonProvider;
-import net.minecraft.registry.RegistryKey;
-import net.minecraft.registry.RegistryKeys;
-import net.minecraft.registry.entry.RegistryEntry;
-import net.minecraft.server.world.ServerWorld;
-import net.minecraft.util.Identifier;
-import net.minecraft.util.WorldSavePath;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.ChunkPos;
-import net.minecraft.world.Heightmap;
-import net.minecraft.world.World;
-import net.minecraft.world.biome.Biome;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.core.Holder;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.storage.LevelResource;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.biome.Biome;
 
 import java.io.Reader;
 import java.nio.file.Files;
@@ -91,8 +91,8 @@ public final class UnloadedChunkCoverageBuilder {
     public void prioritizeFromPlayer(ChunkPos playerChunk) {
         if (this.pendingRegions.isEmpty()) return;
 
-        int playerRegionX = Math.floorDiv(playerChunk.x, 32);
-        int playerRegionZ = Math.floorDiv(playerChunk.z, 32);
+        int playerRegionX = Math.floorDiv(playerChunk.x(), 32);
+        int playerRegionZ = Math.floorDiv(playerChunk.z(), 32);
 
         List<Path> sorted = new ArrayList<>(this.pendingRegions);
         sorted.sort((a, b) -> Long.compare(
@@ -112,7 +112,7 @@ public final class UnloadedChunkCoverageBuilder {
         return dx * dx + dz * dz;
     }
 
-    public void start(ServerWorld world, RuntimeTypes.BudgetProfile profile) {
+    public void start(ServerLevel world, RuntimeTypes.BudgetProfile profile) {
         this.generation++;
         this.shutdownRequested = false;
         this.pendingRegions.clear();
@@ -133,9 +133,9 @@ public final class UnloadedChunkCoverageBuilder {
         }
 
         try {
-            ChunkPos spawnChunk = new ChunkPos(world.getSpawnPos());
-            int spawnRegionX = Math.floorDiv(spawnChunk.x, 32);
-            int spawnRegionZ = Math.floorDiv(spawnChunk.z, 32);
+            ChunkPos spawnChunk = ChunkPos.containing(world.getRespawnData().globalPos().pos());
+            int spawnRegionX = Math.floorDiv(spawnChunk.x(), 32);
+            int spawnRegionZ = Math.floorDiv(spawnChunk.z(), 32);
 
             List<Path> files = Files.list(regionDir)
                     .filter(Files::isRegularFile)
@@ -157,7 +157,7 @@ public final class UnloadedChunkCoverageBuilder {
         this.shutdownRequested = true;
     }
 
-    public void tick(ServerWorld world) {
+    public void tick(ServerLevel world) {
         if (!this.active) return;
 
         RuntimeTypes.Budget budget = this.config.budgetFor(this.activeProfile);
@@ -165,7 +165,7 @@ public final class UnloadedChunkCoverageBuilder {
         long maxMillis = Math.max(5L, budget.maxMillisPerTick());
 
         if (!this.pendingRegions.isEmpty()) {
-            int bottomY = world.getBottomY();
+            int bottomY = world.getMinY();
             int worldHeight = world.getHeight();
             int submissionsThisTick = 0;
             int maxSubmissions = budget.regionsPerTick();
@@ -207,7 +207,7 @@ public final class UnloadedChunkCoverageBuilder {
         }
     }
 
-    private void submitRegionToIOThread(ServerWorld world, Path regionPath, int bottomY, int worldHeight) {
+    private void submitRegionToIOThread(ServerLevel world, Path regionPath, int bottomY, int worldHeight) {
         Matcher matcher = REGION_NAME.matcher(regionPath.getFileName().toString());
         if (!matcher.matches()) return;
 
@@ -236,7 +236,7 @@ public final class UnloadedChunkCoverageBuilder {
                                 regionPath, regionX, regionZ, bottomY, worldHeight);
                         List<ChunkClimateWorkEntry> merged = new ArrayList<>(heights.size());
                         for (RegionHeightmapReader.ChunkSurfaceEntry heightEntry : heights) {
-                            ChunkClimateWorkEntry cached = staticSnapshot.entries().get(heightEntry.chunkPos().toLong());
+                            ChunkClimateWorkEntry cached = staticSnapshot.entries().get(heightEntry.chunkPos().pack());
                             if (cached != null) {
                                 merged.add(cached);
                             } else {
@@ -258,7 +258,7 @@ public final class UnloadedChunkCoverageBuilder {
         });
     }
 
-    private int drainBatch(ServerWorld world, RegionBatch batch, int fromIndex, long startNs, long maxMillis) {
+    private int drainBatch(ServerLevel world, RegionBatch batch, int fromIndex, long startNs, long maxMillis) {
         int i = fromIndex;
         if (batch.knownChunkCount() > 0) {
             this.store.setKnownChunkCount(world, batch.regionX(), batch.regionZ(), batch.knownChunkCount());
@@ -270,34 +270,35 @@ public final class UnloadedChunkCoverageBuilder {
         return i;
     }
 
-    private void processEntry(ServerWorld world, ChunkClimateWorkEntry entry) {
+    private void processEntry(ServerLevel world, ChunkClimateWorkEntry entry) {
         ChunkPos chunkPos = entry.chunkPos();
-        if (world.isChunkLoaded(chunkPos.x, chunkPos.z)) return;
+        if (world.getChunkSource().hasChunk(chunkPos.x(), chunkPos.z())) return;
 
         int surfaceY = entry.surfaceY();
         if (surfaceY == RegionHeightmapReader.UNAVAILABLE) {
-            surfaceY = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,
-                    chunkPos.getStartX() + SAMPLE_LOCAL_X, chunkPos.getStartZ() + SAMPLE_LOCAL_Z) - 1;
+            surfaceY = world.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
+                    chunkPos.getMinBlockX() + SAMPLE_LOCAL_X, chunkPos.getMinBlockZ() + SAMPLE_LOCAL_Z) - 1;
         }
-        surfaceY = Math.max(surfaceY, world.getBottomY());
-        int worldX = chunkPos.getStartX() + SAMPLE_LOCAL_X;
-        int worldZ = chunkPos.getStartZ() + SAMPLE_LOCAL_Z;
+        surfaceY = Math.max(surfaceY, world.getMinY());
+        int worldX = chunkPos.getMinBlockX() + SAMPLE_LOCAL_X;
+        int worldZ = chunkPos.getMinBlockZ() + SAMPLE_LOCAL_Z;
         BlockPos samplePos = new BlockPos(worldX, surfaceY, worldZ);
 
-        RegistryEntry<Biome> biomeEntry = null;
+        Holder<Biome> biomeEntry = null;
         String biomeId = entry.biomeId();
         if (biomeId != null && !biomeId.isBlank()) {
             try {
-                Identifier id = Identifier.of(biomeId);
-                var biomeRegistry = world.getRegistryManager().get(RegistryKeys.BIOME);
-                biomeEntry = biomeRegistry.getEntry(RegistryKey.of(RegistryKeys.BIOME, id)).orElse(null);
+                Identifier id = Identifier.parse(biomeId);
+                biomeEntry = world.registryAccess().lookupOrThrow(Registries.BIOME)
+                        .get(ResourceKey.create(Registries.BIOME, id))
+                        .orElse(null);
             } catch (Exception ignored) {
             }
         }
 
         if (biomeEntry == null) {
             biomeEntry = world.getBiome(samplePos);
-            biomeId = biomeEntry.getKey().map(key -> key.getValue().toString()).orElse(null);
+            biomeId = biomeEntry.unwrapKey().map(key -> key.identifier().toString()).orElse(null);
             if (biomeId == null || biomeId.isBlank()) return;
         }
 
@@ -305,7 +306,8 @@ public final class UnloadedChunkCoverageBuilder {
 
         RuntimeTypes.ChunkSeasonRule rule = this.store.getChunkSeasonRule(world, chunkPos);
         if (rule == null) {
-            rule = ChunkSeasonReconciler.buildChunkSeasonRule(samplePos, biomeEntry, SeasonCacheMod.get().seasonRuleConfig());
+            rule = ChunkSeasonReconciler.buildChunkSeasonRule(
+                    samplePos, biomeEntry, SeasonCacheMod.get().seasonRuleConfig(), world.getSeaLevel());
             this.store.setChunkSeasonRule(world, chunkPos, rule);
         }
 
@@ -318,17 +320,17 @@ public final class UnloadedChunkCoverageBuilder {
         return (System.nanoTime() - startNs) / 1_000_000L;
     }
 
-    private static Path getRegionDirectory(ServerWorld world) {
-        Path root = world.getServer().getSavePath(WorldSavePath.ROOT);
-        String dimPath = world.getRegistryKey() == World.OVERWORLD ? "region"
-                : "dimensions/" + world.getRegistryKey().getValue().getNamespace()
-                + "/" + world.getRegistryKey().getValue().getPath() + "/region";
+    private static Path getRegionDirectory(ServerLevel world) {
+        Path root = world.getServer().getWorldPath(LevelResource.ROOT);
+        String dimPath = world.dimension() == Level.OVERWORLD ? "region"
+                : "dimensions/" + world.dimension().identifier().getNamespace()
+                + "/" + world.dimension().identifier().getPath() + "/region";
         return root.resolve(dimPath);
     }
 
-    private static Path sidecarPath(ServerWorld world, int regionX, int regionZ) {
-        String dimPath = world.getRegistryKey().getValue().getPath();
-        return world.getServer().getSavePath(WorldSavePath.ROOT)
+    private static Path sidecarPath(ServerLevel world, int regionX, int regionZ) {
+        String dimPath = world.dimension().identifier().getPath();
+        return world.getServer().getWorldPath(LevelResource.ROOT)
                 .resolve("seasoncache")
                 .resolve(dimPath)
                 .resolve("r." + regionX + "." + regionZ + ".json");
@@ -346,7 +348,7 @@ public final class UnloadedChunkCoverageBuilder {
             if (disk.staticClimateSamples != null) {
                 for (StaticClimateEntryDisk entry : disk.staticClimateSamples) {
                     if (entry == null || entry.biomeId == null || entry.biomeId.isBlank()) continue;
-                    entries.put(entry.chunkKey, new ChunkClimateWorkEntry(new ChunkPos(entry.chunkKey), entry.surfaceY, entry.biomeId));
+                    entries.put(entry.chunkKey, new ChunkClimateWorkEntry(ChunkPos.unpack(entry.chunkKey), entry.surfaceY, entry.biomeId));
                 }
             }
             return new StaticRegionSnapshot(disk.knownChunkCount, entries);

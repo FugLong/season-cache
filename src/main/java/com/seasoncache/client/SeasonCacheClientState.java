@@ -2,10 +2,10 @@ package com.seasoncache.client;
 
 import com.seasoncache.api.SeasonCacheClientApi;
 import com.seasoncache.network.ChunkStatePacking;
-import net.minecraft.registry.RegistryKey;
-import net.minecraft.registry.RegistryKeys;
-import net.minecraft.util.Identifier;
-import net.minecraft.world.World;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.core.registries.Registries;
+import net.minecraft.resources.Identifier;
+import net.minecraft.world.level.Level;
 
 import java.util.ArrayList;
 import java.util.List;
@@ -24,7 +24,7 @@ import java.util.concurrent.ConcurrentLinkedQueue;
  *    consume via the public API on the client tick.
  */
 public final class SeasonCacheClientState {
-    private static final Map<RegistryKey<World>, DimensionState> DIMENSIONS = new ConcurrentHashMap<>();
+    private static final Map<ResourceKey<Level>, DimensionState> DIMENSIONS = new ConcurrentHashMap<>();
     private static final Queue<SeasonCacheClientApi.ClientSnowEvent> EVENTS = new ConcurrentLinkedQueue<>();
     private static volatile boolean authoritativeSessionActive = false;
 
@@ -41,17 +41,17 @@ public final class SeasonCacheClientState {
         return authoritativeSessionActive;
     }
 
-    public static boolean isSnapshotInProgress(RegistryKey<World> dimension) {
+    public static boolean isSnapshotInProgress(ResourceKey<Level> dimension) {
         DimensionState state = DIMENSIONS.get(dimension);
         return state != null && state.snapshotInProgress;
     }
 
-    public static Integer currentEpoch(RegistryKey<World> dimension) {
+    public static Integer currentEpoch(ResourceKey<Level> dimension) {
         DimensionState state = DIMENSIONS.get(dimension);
         return state != null ? state.epoch : null;
     }
 
-    public static Boolean getChunkSnowState(RegistryKey<World> dimension, int chunkX, int chunkZ) {
+    public static Boolean getChunkSnowState(ResourceKey<Level> dimension, int chunkX, int chunkZ) {
         DimensionState state = DIMENSIONS.get(dimension);
         if (state == null) return null;
         return state.chunkSnowStates.get(packChunkKey(chunkX, chunkZ));
@@ -67,7 +67,7 @@ public final class SeasonCacheClientState {
     }
 
     public static void beginSnapshot(Identifier dimensionId, int epoch) {
-        RegistryKey<World> dimension = toWorldKey(dimensionId);
+        ResourceKey<Level> dimension = toWorldKey(dimensionId);
         DimensionState state = DIMENSIONS.computeIfAbsent(dimension, ignored -> new DimensionState());
         state.chunkSnowStates.clear();
         state.epoch = epoch;
@@ -77,7 +77,7 @@ public final class SeasonCacheClientState {
     }
 
     public static void applyInvalidate(Identifier dimensionId, int epoch) {
-        RegistryKey<World> dimension = toWorldKey(dimensionId);
+        ResourceKey<Level> dimension = toWorldKey(dimensionId);
         DimensionState state = DIMENSIONS.computeIfAbsent(dimension, ignored -> new DimensionState());
         state.chunkSnowStates.clear();
         state.epoch = epoch;
@@ -87,7 +87,7 @@ public final class SeasonCacheClientState {
     }
 
     public static void endSnapshot(Identifier dimensionId, int epoch) {
-        RegistryKey<World> dimension = toWorldKey(dimensionId);
+        ResourceKey<Level> dimension = toWorldKey(dimensionId);
         DimensionState state = DIMENSIONS.computeIfAbsent(dimension, ignored -> new DimensionState());
         state.epoch = epoch;
         state.snapshotInProgress = false;
@@ -95,7 +95,7 @@ public final class SeasonCacheClientState {
     }
 
     public static void applyChunkBatch(Identifier dimensionId, int epoch, long[] packedChunkStates) {
-        RegistryKey<World> dimension = toWorldKey(dimensionId);
+        ResourceKey<Level> dimension = toWorldKey(dimensionId);
         DimensionState state = DIMENSIONS.computeIfAbsent(dimension, ignored -> new DimensionState());
         state.epoch = epoch;
         authoritativeSessionActive = true;
@@ -113,8 +113,8 @@ public final class SeasonCacheClientState {
         return (((long) chunkX) << 32) ^ (chunkZ & 0xFFFFFFFFL);
     }
 
-    private static RegistryKey<World> toWorldKey(Identifier dimensionId) {
-        return RegistryKey.of(RegistryKeys.WORLD, Objects.requireNonNull(dimensionId));
+    private static ResourceKey<Level> toWorldKey(Identifier dimensionId) {
+        return ResourceKey.create(Registries.DIMENSION, Objects.requireNonNull(dimensionId));
     }
 
     private static final class DimensionState {

@@ -16,23 +16,23 @@ import com.seasoncache.network.SeasonCacheNetworking;
 import com.seasoncache.server.SeasonCacheSyncManager;
 import net.fabricmc.api.ModInitializer;
 import net.fabricmc.fabric.api.command.v2.CommandRegistrationCallback;
-import net.fabricmc.fabric.api.entity.event.v1.ServerEntityWorldChangeEvents;
+import net.fabricmc.fabric.api.entity.event.v1.ServerEntityLevelChangeEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerChunkEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerLifecycleEvents;
 import net.fabricmc.fabric.api.event.lifecycle.v1.ServerTickEvents;
 import net.fabricmc.fabric.api.networking.v1.ServerPlayConnectionEvents;
-import net.minecraft.registry.RegistryKey;
-import net.minecraft.registry.entry.RegistryEntry;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.core.Holder;
 import net.minecraft.server.MinecraftServer;
-import net.minecraft.server.network.ServerPlayerEntity;
-import net.minecraft.server.world.ServerWorld;
-import net.minecraft.util.Identifier;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.ChunkPos;
-import net.minecraft.world.Heightmap;
-import net.minecraft.world.World;
-import net.minecraft.world.biome.Biome;
-import net.minecraft.world.chunk.WorldChunk;
+import net.minecraft.server.level.ServerPlayer;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.resources.Identifier;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.Level;
+import net.minecraft.world.level.biome.Biome;
+import net.minecraft.world.level.chunk.LevelChunk;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -55,6 +55,8 @@ public final class SeasonCacheMod implements ModInitializer {
 
     private static final int FIRST_PLAYER_ACTIVATION_DELAY_TICKS = 40;
     private static final int SEASON_CHANGE_SWEEP_DELAY_TICKS = 40;
+    /** Avoid world queries during {@link ServerChunkEvents#CHUNK_LOAD} (re-entrancy with C2ME). */
+    private static final int DERIVATION_SCHEDULE_DRAIN_PER_TICK = 16;
 
     private SeasonCacheConfig config;
     private SeasonProvider seasonProvider;
@@ -70,7 +72,7 @@ public final class SeasonCacheMod implements ModInitializer {
 
     private Integer lastKnownEpoch = null;
     private int neighbourhoodTick = 0;
-    private final Map<RegistryKey<World>, Set<Long>> loadedChunkKeys = new HashMap<>();
+    private final Map<ResourceKey<Level>, Set<Long>> loadedChunkKeys = new HashMap<>();
     private final ArrayDeque<Long> loadedSweepQueue = new ArrayDeque<>();
     private final Set<Long> loadedSweepQueued = new HashSet<>();
     private int loadedSweepEpoch = 0;
@@ -82,6 +84,7 @@ public final class SeasonCacheMod implements ModInitializer {
     private final ConcurrentLinkedQueue<RuleDerivationThread.DerivationResult> derivationResults
             = new ConcurrentLinkedQueue<>();
     private final Set<Long> pendingDerivations = ConcurrentHashMap.newKeySet();
+    private final ConcurrentLinkedQueue<PendingDerivation> derivationScheduleQueue = new ConcurrentLinkedQueue<>();
 
     private boolean pendingStartupInvalidation = false;
     private boolean runtimeActivated = false;
@@ -122,11 +125,11 @@ public final class SeasonCacheMod implements ModInitializer {
         CommandRegistrationCallback.EVENT.register((dispatcher, registryAccess, environment) ->
                 SeasonCacheCommands.register(dispatcher));
 
-        ServerChunkEvents.CHUNK_LOAD.register(this::onChunkLoad);
+        ServerChunkEvents.CHUNK_LOAD.register((world, chunk, newTick) -> onChunkLoad(world, chunk));
         ServerChunkEvents.CHUNK_UNLOAD.register(this::onChunkUnload);
         ServerPlayConnectionEvents.JOIN.register((handler, sender, server) -> this.onPlayerJoin(handler.getPlayer()));
         ServerPlayConnectionEvents.DISCONNECT.register((handler, server) -> this.syncManager.removePlayer(handler.getPlayer()));
-        ServerEntityWorldChangeEvents.AFTER_PLAYER_CHANGE_WORLD.register(this::onPlayerChangeWorld);
+        ServerEntityLevelChangeEvents.AFTER_PLAYER_CHANGE_LEVEL.register(this::onPlayerChangeWorld);
 
         ServerLifecycleEvents.SERVER_STARTED.register(server -> {
             this.ioThread.start();
@@ -150,11 +153,12 @@ public final class SeasonCacheMod implements ModInitializer {
             }
             SereneSeasonTomlConfig.writeCachedHash(server, this.seasonRuleConfig.hash());
 
-            ServerWorld overworld = server.getOverworld();
+            ServerLevel overworld = server.overworld();
             if (overworld != null) {
                 try {
-                    var allBiomes = server.getRegistryManager().get(net.minecraft.registry.RegistryKeys.BIOME)
-                            .streamEntries()
+                    var allBiomes = server.registryAccess()
+                            .lookupOrThrow(net.minecraft.core.registries.Registries.BIOME)
+                            .listElements()
                             .toList();
                     this.seasonalColdOverrides = this.seasonProvider.buildSeasonalOverrideSet(overworld, allBiomes);
                 } catch (Exception e) {
@@ -169,10 +173,11 @@ public final class SeasonCacheMod implements ModInitializer {
             tickRuntimeActivation(server);
             if (!this.runtimeActivated) return;
 
-            ServerWorld overworld = server.getOverworld();
+            ServerLevel overworld = server.overworld();
             if (overworld == null) return;
 
             this.coverageBuilder.tick(overworld);
+            drainScheduledDerivations(server);
             drainDerivationResults(overworld);
             drainLoadedChunkSweep(overworld);
             this.syncManager.tick(server);
@@ -220,20 +225,20 @@ public final class SeasonCacheMod implements ModInitializer {
         LOGGER.info("Season Cache initialized. provider={}", this.seasonProvider.getProviderId());
     }
 
-    private void onChunkLoad(ServerWorld world, WorldChunk chunk) {
+    private void onChunkLoad(ServerLevel world, LevelChunk chunk) {
         if (!this.config.enabled) return;
-        if (this.config.overworldOnly && world.getRegistryKey() != World.OVERWORLD) return;
+        if (this.config.overworldOnly && world.dimension() != Level.OVERWORLD) return;
 
         ChunkPos chunkPos = chunk.getPos();
-        this.loadedChunkKeys.computeIfAbsent(world.getRegistryKey(), k -> new HashSet<>()).add(chunkPos.toLong());
+        this.loadedChunkKeys.computeIfAbsent(world.dimension(), k -> new HashSet<>()).add(chunkPos.pack());
 
         if (!this.runtimeActivated) return;
 
         int currentEpoch = this.epochService.currentEpoch(world);
 
         if (!this.store.hasChunkSeasonRule(world, chunkPos)) {
-            // No rule yet — queue for derivation. Sweep and sync fire after rule lands.
-            submitDerivationTask(world, chunkPos);
+            // No rule yet — schedule derivation on a later tick (not during CHUNK_LOAD).
+            scheduleDerivation(world, chunkPos);
         } else {
             if (!this.store.isChunkSwept(world, chunkPos, currentEpoch)) {
                 // Rule exists but not yet confirmed swept this epoch — enqueue for sweep.
@@ -251,22 +256,49 @@ public final class SeasonCacheMod implements ModInitializer {
     }
 
     /**
+     * Queues rule derivation for a later server tick. Must not run synchronous
+     * world access from {@link ServerChunkEvents#CHUNK_LOAD} (deadlocks with C2ME).
+     */
+    private void scheduleDerivation(ServerLevel world, ChunkPos chunkPos) {
+        long key = chunkPos.pack();
+        if (!this.pendingDerivations.add(key)) return;
+        this.derivationScheduleQueue.offer(new PendingDerivation(world.dimension(), key));
+    }
+
+    private void drainScheduledDerivations(MinecraftServer server) {
+        int limit = DERIVATION_SCHEDULE_DRAIN_PER_TICK;
+        PendingDerivation pending;
+        while (limit-- > 0 && (pending = this.derivationScheduleQueue.poll()) != null) {
+            ServerLevel world = server.getLevel(pending.dimension());
+            if (world == null || !isChunkLoaded(world, pending.chunkKey())) {
+                this.pendingDerivations.remove(pending.chunkKey());
+                continue;
+            }
+            submitDerivationTask(world, ChunkPos.unpack(pending.chunkKey()));
+        }
+    }
+
+    private boolean isChunkLoaded(ServerLevel world, long chunkKey) {
+        Set<Long> loaded = this.loadedChunkKeys.get(world.dimension());
+        return loaded != null && loaded.contains(chunkKey);
+    }
+
+    /**
      * Resolves world-dependent inputs on the main thread, then submits the
      * temperature computation to the derivation thread (or IO thread fallback).
-     * Deduplicates — chunks already pending derivation are skipped.
+     * Caller must have reserved the chunk via {@link #scheduleDerivation} first.
      */
-    private void submitDerivationTask(ServerWorld world, ChunkPos chunkPos) {
-        long key = chunkPos.toLong();
-        if (!this.pendingDerivations.add(key)) return; // already queued
+    private void submitDerivationTask(ServerLevel world, ChunkPos chunkPos) {
+        long key = chunkPos.pack();
 
-        int worldX = chunkPos.getStartX() + 8;
-        int worldZ = chunkPos.getStartZ() + 8;
+        int worldX = chunkPos.getMinBlockX() + 8;
+        int worldZ = chunkPos.getMinBlockZ() + 8;
         int surfaceY = Math.max(
-                world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES, worldX, worldZ) - 1,
-                world.getBottomY());
+                world.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES, worldX, worldZ) - 1,
+                world.getMinY());
         BlockPos samplePos = new BlockPos(worldX, surfaceY, worldZ);
-        RegistryEntry<Biome> biomeEntry = world.getBiome(samplePos);
-        String biomeId = biomeEntry.getKey().map(k -> k.getValue().toString()).orElse(null);
+        Holder<Biome> biomeEntry = world.getBiome(samplePos);
+        String biomeId = biomeEntry.unwrapKey().map(k -> k.identifier().toString()).orElse(null);
         if (biomeId == null || biomeId.isBlank()) {
             this.pendingDerivations.remove(key);
             return;
@@ -275,7 +307,7 @@ public final class SeasonCacheMod implements ModInitializer {
         RuntimeTypes.StaticChunkClimate staticSample = new RuntimeTypes.StaticChunkClimate(biomeId, surfaceY);
         RuntimeTypes.SeasonRuleConfig ruleConfig = this.seasonRuleConfig;
         RuleDerivationThread.DerivationTask task = new RuleDerivationThread.DerivationTask(
-                chunkPos, samplePos, biomeEntry, ruleConfig, staticSample);
+                chunkPos, samplePos, biomeEntry, ruleConfig, staticSample, world.getSeaLevel());
 
         if (this.derivationThread != null) {
             this.derivationThread.submit(task);
@@ -283,7 +315,7 @@ public final class SeasonCacheMod implements ModInitializer {
             // IO thread fallback — same computation, different executor
             this.ioThread.submitHeightmapRead(() -> {
                 RuntimeTypes.ChunkSeasonRule rule = ChunkSeasonReconciler.buildChunkSeasonRule(
-                        samplePos, biomeEntry, ruleConfig);
+                        samplePos, biomeEntry, ruleConfig, world.getSeaLevel());
                 this.derivationResults.offer(
                         new RuleDerivationThread.DerivationResult(chunkPos, rule, staticSample));
             });
@@ -296,14 +328,14 @@ public final class SeasonCacheMod implements ModInitializer {
      * for sweep. markChunkSwept is NOT called here — it is called only after
      * reconciler.reconcile actually executes inside drainLoadedChunkSweep.
      */
-    private void drainDerivationResults(ServerWorld world) {
+    private void drainDerivationResults(ServerLevel world) {
         if (this.derivationResults.isEmpty()) return;
         int currentEpoch = this.epochService.currentEpoch(world);
         int limit = 32;
         RuleDerivationThread.DerivationResult result;
         while ((result = this.derivationResults.poll()) != null && limit-- > 0) {
             ChunkPos chunkPos = result.chunkPos();
-            this.pendingDerivations.remove(chunkPos.toLong());
+            this.pendingDerivations.remove(chunkPos.pack());
             RuntimeTypes.ChunkSeasonRule rule = result.rule();
             if (rule == null) continue;
             this.store.setStaticClimateSample(world, chunkPos,
@@ -313,43 +345,45 @@ public final class SeasonCacheMod implements ModInitializer {
         }
     }
 
-    private void onChunkUnload(ServerWorld world, WorldChunk chunk) {
-        if (this.config.overworldOnly && world.getRegistryKey() != World.OVERWORLD) return;
-        Set<Long> set = this.loadedChunkKeys.get(world.getRegistryKey());
-        if (set != null) set.remove(chunk.getPos().toLong());
+    private void onChunkUnload(ServerLevel world, LevelChunk chunk) {
+        if (this.config.overworldOnly && world.dimension() != Level.OVERWORLD) return;
+        long key = chunk.getPos().pack();
+        Set<Long> set = this.loadedChunkKeys.get(world.dimension());
+        if (set != null) set.remove(key);
+        this.pendingDerivations.remove(key);
     }
 
-    private void onPlayerJoin(ServerPlayerEntity player) {
+    private void onPlayerJoin(ServerPlayer player) {
         if (!this.config.enabled) return;
-        if (player.getWorld().getRegistryKey() != World.OVERWORLD) return;
+        if (player.level().dimension() != Level.OVERWORLD) return;
 
         armRuntimeActivation();
 
         if (this.coverageBuilder.isActive()) {
-            this.coverageBuilder.prioritizeFromPlayer(player.getChunkPos());
+            this.coverageBuilder.prioritizeFromPlayer(player.chunkPosition());
         } else if (this.runtimeActivated) {
             // Builder has finished — restart at LOW budget so this player receives
             // all chunk states via the delta stream. On a warm cache the builder
             // fast-paths through STATIC_ONLY and completes in seconds with minimal
             // tick cost. All players in playerStates receive the deltas.
             this.coverageBuilder.start(
-                    (ServerWorld) player.getWorld(), RuntimeTypes.BudgetProfile.LOW);
+                    (ServerLevel) player.level(), RuntimeTypes.BudgetProfile.LOW);
         }
 
         if (this.runtimeActivated) {
-            int currentEpoch = this.epochService.currentEpoch((ServerWorld) player.getWorld());
+            int currentEpoch = this.epochService.currentEpoch((ServerLevel) player.level());
             this.syncManager.scheduleInitialSnapshot(player, currentEpoch);
         }
     }
 
-    private void onPlayerChangeWorld(ServerPlayerEntity player, ServerWorld origin, ServerWorld destination) {
+    private void onPlayerChangeWorld(ServerPlayer player, ServerLevel origin, ServerLevel destination) {
         if (!this.config.enabled) return;
-        if (destination.getRegistryKey() != World.OVERWORLD) return;
+        if (destination.dimension() != Level.OVERWORLD) return;
 
         armRuntimeActivation();
 
         if (this.coverageBuilder.isActive()) {
-            this.coverageBuilder.prioritizeFromPlayer(player.getChunkPos());
+            this.coverageBuilder.prioritizeFromPlayer(player.chunkPosition());
         } else if (this.runtimeActivated) {
             // Same as onPlayerJoin — restart at LOW budget for complete delta coverage.
             this.coverageBuilder.start(destination, RuntimeTypes.BudgetProfile.LOW);
@@ -361,24 +395,24 @@ public final class SeasonCacheMod implements ModInitializer {
         }
     }
 
-    public void onChunkAuthoritativelyReconciled(ServerWorld world, ChunkPos chunkPos, int currentEpoch) {
+    public void onChunkAuthoritativelyReconciled(ServerLevel world, ChunkPos chunkPos, int currentEpoch) {
         Boolean snowy = this.store.getAuthoritativeChunkSnowState(world, chunkPos, currentEpoch);
         if (snowy != null) {
             this.syncManager.queueChunkStateUpdate(world, chunkPos, currentEpoch, snowy);
         }
     }
 
-    public void onChunkCoverageComputed(ServerWorld world, ChunkPos chunkPos, int currentEpoch, boolean snowy) {
+    public void onChunkCoverageComputed(ServerLevel world, ChunkPos chunkPos, int currentEpoch, boolean snowy) {
         this.syncManager.queueChunkStateUpdate(world, chunkPos, currentEpoch, snowy);
     }
 
     private void refreshPlayerNeighbourhood(MinecraftServer server) {
         Set<String> neighbourhood = new HashSet<>();
-        for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-            if (player.getWorld().getRegistryKey() != World.OVERWORLD) continue;
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (player.level().dimension() != Level.OVERWORLD) continue;
             int regionX = Math.floorDiv((int) player.getX() >> 4, 32);
             int regionZ = Math.floorDiv((int) player.getZ() >> 4, 32);
-            String dim = World.OVERWORLD.getValue().toString();
+            String dim = Level.OVERWORLD.identifier().toString();
 
             for (int dx = -1; dx <= 1; dx++) {
                 for (int dz = -1; dz <= 1; dz++) {
@@ -391,9 +425,9 @@ public final class SeasonCacheMod implements ModInitializer {
 
     private void onSeasonChanged(MinecraftServer server, String newSeasonKey, int newEpoch) {
         this.lastKnownEpoch = newEpoch;
-        this.syncManager.broadcastEpochInvalidate(server, World.OVERWORLD, newEpoch);
+        this.syncManager.broadcastEpochInvalidate(server, Level.OVERWORLD, newEpoch);
 
-        ServerWorld overworld = server.getOverworld();
+        ServerLevel overworld = server.overworld();
         if (overworld != null) {
             // Clear sweep records for all loaded chunks so each gets a fresh baseline
             // pass on the new epoch. The new epoch's sweep entries will be written as
@@ -430,7 +464,7 @@ public final class SeasonCacheMod implements ModInitializer {
         if (this.activationTicksRemaining > 0) return;
         this.activationTicksRemaining = -1;
 
-        ServerWorld overworld = server.getOverworld();
+        ServerLevel overworld = server.overworld();
         if (overworld == null) return;
 
         if (this.pendingStartupInvalidation) {
@@ -448,8 +482,8 @@ public final class SeasonCacheMod implements ModInitializer {
         // the full FULL_SCAN pass. No cold-cache detection needed.
         this.coverageBuilder.start(overworld, RuntimeTypes.BudgetProfile.HIGH);
 
-        for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-            if (player.getWorld().getRegistryKey() == World.OVERWORLD) {
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (player.level().dimension() == Level.OVERWORLD) {
                 this.syncManager.scheduleInitialSnapshot(player, currentEpoch);
             }
         }
@@ -464,7 +498,7 @@ public final class SeasonCacheMod implements ModInitializer {
      * (e.g. after a bug fix that changes removal logic).
      */
     public void forceSweepLoadedChunks(MinecraftServer server) {
-        ServerWorld overworld = server.getOverworld();
+        ServerLevel overworld = server.overworld();
         int epoch = this.epochService.currentEpoch(overworld);
         Set<ChunkPos> candidates = collectLoadedTransitionCandidates(server, overworld);
         for (ChunkPos chunkPos : candidates) {
@@ -474,11 +508,11 @@ public final class SeasonCacheMod implements ModInitializer {
         enqueueLoadedChunkSweep(server, overworld, epoch, "force-sweep");
     }
 
-    private void enqueueLoadedChunkSweep(MinecraftServer server, ServerWorld overworld, int epoch, String reason) {
-        ChunkPos origin = new ChunkPos(overworld.getSpawnPos());
-        for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-            if (player.getWorld().getRegistryKey() == World.OVERWORLD) {
-                origin = player.getChunkPos();
+    private void enqueueLoadedChunkSweep(MinecraftServer server, ServerLevel overworld, int epoch, String reason) {
+        ChunkPos origin = ChunkPos.containing(overworld.getRespawnData().globalPos().pos());
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (player.level().dimension() == Level.OVERWORLD) {
+                origin = player.chunkPosition();
                 break;
             }
         }
@@ -488,15 +522,15 @@ public final class SeasonCacheMod implements ModInitializer {
         List<ChunkPos> reconcileList = new ArrayList<>();
         for (ChunkPos chunkPos : candidateChunks) {
             if (!this.store.hasChunkSeasonRule(overworld, chunkPos)) {
-                // No rule yet — queue for derivation; sweep will follow automatically
-                submitDerivationTask(overworld, chunkPos);
+                // No rule yet — schedule derivation; sweep will follow automatically
+                scheduleDerivation(overworld, chunkPos);
             } else {
                 reconcileList.add(chunkPos);
             }
         }
 
         reconcileList.sort(Comparator.comparingInt(cp ->
-                Math.max(Math.abs(cp.x - sortOrigin.x), Math.abs(cp.z - sortOrigin.z))));
+                Math.max(Math.abs(cp.x() - sortOrigin.x()), Math.abs(cp.z() - sortOrigin.z()))));
 
         // Don't clear the queue — chunks already enqueued via onChunkLoad (which fired
         // between the season change detection and this sweep) must not be dropped.
@@ -504,14 +538,14 @@ public final class SeasonCacheMod implements ModInitializer {
         // and append with deduplication via loadedSweepQueued.
         this.loadedSweepEpoch = epoch;
         for (ChunkPos chunkPos : reconcileList) {
-            long key = chunkPos.toLong();
+            long key = chunkPos.pack();
             if (this.loadedSweepQueued.add(key)) {
                 this.loadedSweepQueue.addLast(key);
             }
         }
 
         LOGGER.info("Season Cache: {} loaded-chunk sweep queued {} chunks for epoch {} from origin [{}, {}].",
-                reason, reconcileList.size(), epoch, sortOrigin.x, sortOrigin.z);
+                reason, reconcileList.size(), epoch, sortOrigin.x(), sortOrigin.z());
     }
 
     private void enqueueChunkForSweep(ChunkPos chunkPos, int epoch) {
@@ -520,13 +554,13 @@ public final class SeasonCacheMod implements ModInitializer {
             this.loadedSweepQueued.clear();
             this.loadedSweepEpoch = epoch;
         }
-        long key = chunkPos.toLong();
+        long key = chunkPos.pack();
         if (this.loadedSweepQueued.add(key)) {
             this.loadedSweepQueue.addLast(key);
         }
     }
 
-    private void drainLoadedChunkSweep(ServerWorld overworld) {
+    private void drainLoadedChunkSweep(ServerLevel overworld) {
         if (this.loadedSweepQueue.isEmpty()) return;
 
         int currentEpoch = this.epochService.currentEpoch(overworld);
@@ -544,9 +578,9 @@ public final class SeasonCacheMod implements ModInitializer {
                 && ((System.nanoTime() - startNs) / 1_000_000L) < maxMillis) {
             long key = this.loadedSweepQueue.removeFirst();
             this.loadedSweepQueued.remove(key);
-            ChunkPos chunkPos = new ChunkPos(key);
+            ChunkPos chunkPos = ChunkPos.unpack(key);
 
-            if (!overworld.isChunkLoaded(chunkPos.x, chunkPos.z)) continue;
+            if (!overworld.getChunkSource().hasChunk(chunkPos.x(), chunkPos.z())) continue;
             if (this.store.isChunkClean(overworld, chunkPos, currentEpoch)) {
                 // Already clean — stamp swept so future loads skip it, but don't
                 // re-run applyChunkTruth since reconcile already ran for this chunk.
@@ -562,28 +596,30 @@ public final class SeasonCacheMod implements ModInitializer {
     }
 
     private boolean hasOverworldPlayers(MinecraftServer server) {
-        for (ServerPlayerEntity player : server.getPlayerManager().getPlayerList()) {
-            if (player.getWorld().getRegistryKey() == World.OVERWORLD) {
+        for (ServerPlayer player : server.getPlayerList().getPlayers()) {
+            if (player.level().dimension() == Level.OVERWORLD) {
                 return true;
             }
         }
         return false;
     }
 
-    private Set<ChunkPos> collectLoadedTransitionCandidates(MinecraftServer server, ServerWorld overworld) {
+    private Set<ChunkPos> collectLoadedTransitionCandidates(MinecraftServer server, ServerLevel overworld) {
         // Use the full set of tracked loaded chunks rather than a radius around players.
         // The radius approach missed chunks loaded by other players, force-loaded chunks,
         // or large bases that extend beyond the sweep radius — causing partial sweeps.
         // loadedChunkKeys is maintained by onChunkLoad/onChunkUnload and accurately
         // reflects every chunk currently in memory.
-        Set<Long> overworldLoaded = this.loadedChunkKeys.getOrDefault(World.OVERWORLD, Set.of());
+        Set<Long> overworldLoaded = this.loadedChunkKeys.getOrDefault(Level.OVERWORLD, Set.of());
         Set<ChunkPos> candidateChunks = new HashSet<>(overworldLoaded.size());
         for (long posLong : overworldLoaded) {
-            ChunkPos chunkPos = new ChunkPos(posLong);
-            if (overworld.isChunkLoaded(chunkPos.x, chunkPos.z)) {
+            ChunkPos chunkPos = ChunkPos.unpack(posLong);
+            if (overworld.getChunkSource().hasChunk(chunkPos.x(), chunkPos.z())) {
                 candidateChunks.add(chunkPos);
             }
         }
         return candidateChunks;
     }
+
+    private record PendingDerivation(ResourceKey<Level> dimension, long chunkKey) {}
 }

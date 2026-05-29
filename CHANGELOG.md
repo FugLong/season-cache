@@ -1,5 +1,22 @@
 # Changelog
 
+## 1.4.0 — Minecraft 26.1.x port
+
+Ported from 1.21.1 to Minecraft 26.1.2 using Mojang official mappings and Fabric Loom 1.16 (unobfuscated toolchain). The mod jar targets 26.1.2 and is intended to run on 26.1, 26.1.1, and 26.1.2 with matching Serene Seasons and Fabric API versions.
+
+### Build / toolchain
+
+- Java 25, Gradle 9.4.1, Fabric Loader 0.19.2, Fabric API 0.150.0+26.1.2
+- Serene Seasons API: `getBiomeTemperature` / `getBiomeTemperatureInSeason` now require sea level; sub-season names use `getSerializedName()`
+
+### Fabric API updates (26.1)
+
+- Payload registration: `PayloadTypeRegistry.clientboundPlay()` (replaces `playS2C`)
+- Dimension change event: `ServerEntityLevelChangeEvents.AFTER_PLAYER_CHANGE_LEVEL` (replaces `ServerEntityWorldChangeEvents`)
+- Chunk load callback includes a third `newTick` argument
+
+---
+
 ## 1.3.1 — Bug fixes and dead code removal
 
 ### Bug fix — snow_placement_blacklist not applied

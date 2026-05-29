@@ -1,6 +1,6 @@
 package com.seasoncache.core;
 
-import net.minecraft.util.math.ChunkPos;
+import net.minecraft.world.level.ChunkPos;
 
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;

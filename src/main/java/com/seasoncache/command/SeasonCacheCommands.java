@@ -4,57 +4,57 @@ import com.mojang.brigadier.CommandDispatcher;
 import com.seasoncache.SeasonCacheMod;
 import com.seasoncache.config.SeasonCacheConfig;
 import com.seasoncache.core.RuntimeTypes;
-import net.minecraft.registry.entry.RegistryEntry;
-import net.minecraft.server.command.CommandManager;
-import net.minecraft.server.command.ServerCommandSource;
-import net.minecraft.server.world.ServerWorld;
-import net.minecraft.text.Text;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.util.math.ChunkPos;
-import net.minecraft.world.Heightmap;
-import net.minecraft.world.biome.Biome;
+import net.minecraft.core.Holder;
+import net.minecraft.commands.Commands;
+import net.minecraft.commands.CommandSourceStack;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.network.chat.Component;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.ChunkPos;
+import net.minecraft.world.level.levelgen.Heightmap;
+import net.minecraft.world.level.biome.Biome;
 import sereneseasons.season.SeasonHooks;
 
 public final class SeasonCacheCommands {
     private SeasonCacheCommands() {
     }
 
-    public static void register(CommandDispatcher<ServerCommandSource> dispatcher) {
-        dispatcher.register(CommandManager.literal("seasoncache")
-                .requires(source -> source.hasPermissionLevel(2))
-                .then(CommandManager.literal("status")
+    public static void register(CommandDispatcher<CommandSourceStack> dispatcher) {
+        dispatcher.register(Commands.literal("seasoncache")
+                .requires(source -> Commands.LEVEL_GAMEMASTERS.check(source.permissions()))
+                .then(Commands.literal("status")
                         .executes(ctx -> runStatus(ctx.getSource())))
-                .then(CommandManager.literal("mode")
-                        .then(CommandManager.literal("conservative")
+                .then(Commands.literal("mode")
+                        .then(Commands.literal("conservative")
                                 .executes(ctx -> setMode(ctx.getSource(), SeasonCacheConfig.CleanupMode.CONSERVATIVE)))
-                        .then(CommandManager.literal("aggressive")
+                        .then(Commands.literal("aggressive")
                                 .executes(ctx -> setMode(ctx.getSource(), SeasonCacheConfig.CleanupMode.AGGRESSIVE))))
-                .then(CommandManager.literal("build")
-                        .then(CommandManager.literal("low")
+                .then(Commands.literal("build")
+                        .then(Commands.literal("low")
                                 .executes(ctx -> startBuild(ctx.getSource(), RuntimeTypes.BudgetProfile.LOW, false)))
-                        .then(CommandManager.literal("high")
+                        .then(Commands.literal("high")
                                 .executes(ctx -> startBuild(ctx.getSource(), RuntimeTypes.BudgetProfile.HIGH, false))))
-                .then(CommandManager.literal("rebuild")
-                        .then(CommandManager.literal("low")
+                .then(Commands.literal("rebuild")
+                        .then(Commands.literal("low")
                                 .executes(ctx -> startBuild(ctx.getSource(), RuntimeTypes.BudgetProfile.LOW, true)))
-                        .then(CommandManager.literal("high")
+                        .then(Commands.literal("high")
                                 .executes(ctx -> startBuild(ctx.getSource(), RuntimeTypes.BudgetProfile.HIGH, true))))
-                .then(CommandManager.literal("invalidate")
-                        .then(CommandManager.literal("all")
+                .then(Commands.literal("invalidate")
+                        .then(Commands.literal("all")
                                 .executes(ctx -> invalidateAll(ctx.getSource()))))
-                .then(CommandManager.literal("debug")
+                .then(Commands.literal("debug")
                         .executes(ctx -> runTempDebug(ctx.getSource())))
-                .then(CommandManager.literal("debugstate")
+                .then(Commands.literal("debugstate")
                         .executes(ctx -> runDebugState(ctx.getSource())))
-                .then(CommandManager.literal("sweep")
+                .then(Commands.literal("sweep")
                         .executes(ctx -> runSweep(ctx.getSource()))));
     }
 
-    private static int runStatus(ServerCommandSource source) {
+    private static int runStatus(CommandSourceStack source) {
         SeasonCacheMod mod = SeasonCacheMod.get();
-        ServerWorld overworld = source.getServer().getOverworld();
+        ServerLevel overworld = source.getServer().overworld();
         if (overworld == null) {
-            source.sendError(Text.literal("Overworld is not available."));
+            source.sendFailure(Component.literal("Overworld is not available."));
             return 0;
         }
 
@@ -68,7 +68,7 @@ public final class SeasonCacheCommands {
                   + (mod.ioThread().isInvalidationComplete() ? " (complete)" : " (running)")
                 : "";
 
-        source.sendFeedback(() -> Text.literal(
+        source.sendSuccess(() -> Component.literal(
                 "Season Cache"
                 + " | provider=" + snapshot.providerId()
                 + " | season=" + snapshot.seasonKey()
@@ -86,7 +86,7 @@ public final class SeasonCacheCommands {
         return 1;
     }
 
-    private static int setMode(ServerCommandSource source, SeasonCacheConfig.CleanupMode mode) {
+    private static int setMode(CommandSourceStack source, SeasonCacheConfig.CleanupMode mode) {
         SeasonCacheMod mod = SeasonCacheMod.get();
         mod.config().cleanupMode = mode;
         mod.config().save();
@@ -96,17 +96,17 @@ public final class SeasonCacheCommands {
             case AGGRESSIVE   -> "remove and place (fully matches season)";
         };
 
-        source.sendFeedback(() -> Text.literal(
+        source.sendSuccess(() -> Component.literal(
                 "Season Cache mode set to " + mode.name().toLowerCase() + " — " + description
         ), true);
         return 1;
     }
 
-    private static int startBuild(ServerCommandSource source, RuntimeTypes.BudgetProfile profile, boolean invalidateFirst) {
+    private static int startBuild(CommandSourceStack source, RuntimeTypes.BudgetProfile profile, boolean invalidateFirst) {
         SeasonCacheMod mod = SeasonCacheMod.get();
-        ServerWorld overworld = source.getServer().getOverworld();
+        ServerLevel overworld = source.getServer().overworld();
         if (overworld == null) {
-            source.sendError(Text.literal("Overworld is not available."));
+            source.sendFailure(Component.literal("Overworld is not available."));
             return 0;
         }
 
@@ -115,26 +115,26 @@ public final class SeasonCacheCommands {
         }
 
         mod.coverageBuilder().start(overworld, profile);
-        source.sendFeedback(() -> Text.literal(
+        source.sendSuccess(() -> Component.literal(
                 (invalidateFirst ? "Rebuild" : "Build") + " started with "
                 + profile.name().toLowerCase() + " budget."
         ), true);
         return 1;
     }
 
-    private static int invalidateAll(ServerCommandSource source) {
+    private static int invalidateAll(CommandSourceStack source) {
         SeasonCacheMod mod = SeasonCacheMod.get();
 
         // In-memory state is cleared immediately on the tick thread.
         // On-disk zeroing runs in the background on the IO thread at LOW priority.
         // Use /seasoncache status to monitor the disk pass progress before restarting.
         mod.store().invalidateAll(source.getServer());
-        ServerWorld overworld = source.getServer().getOverworld();
+        ServerLevel overworld = source.getServer().overworld();
         if (overworld != null) {
             mod.coverageBuilder().start(overworld, mod.config().gameplayBudget);
         }
 
-        source.sendFeedback(() -> Text.literal(
+        source.sendSuccess(() -> Component.literal(
                 "Season Cache: in-memory state cleared. " +
                 "On-disk epoch zeroing is running in the background (LOW priority). " +
                 "Use /seasoncache status to monitor progress. " +
@@ -159,29 +159,29 @@ public final class SeasonCacheCommands {
      * placed), inside the band (probabilistic — check the noise distribution), or at the
      * boundary of an adjacent chunk (explaining a sharp edge pattern).
      */
-    private static int runTempDebug(ServerCommandSource source) {
+    private static int runTempDebug(CommandSourceStack source) {
         SeasonCacheMod mod = SeasonCacheMod.get();
-        ServerWorld world = source.getWorld();
+        ServerLevel world = source.getLevel();
 
         float threshold = 0.15f;
         float bandWidth = mod.config().hysteresisBandWidth;
         float coldEdge  = threshold - bandWidth;
         float warmEdge  = threshold + bandWidth;
 
-        ChunkPos playerChunk = new ChunkPos(BlockPos.ofFloored(source.getPosition()));
+        ChunkPos playerChunk = ChunkPos.containing(BlockPos.containing(source.getPosition()));
         RuntimeTypes.SeasonSnapshot snapshot = mod.seasonProvider().snapshot(world);
 
-        source.sendFeedback(() -> Text.literal(String.format(
+        source.sendSuccess(() -> Component.literal(String.format(
                 "[SC Debug | %s | band %.3f\u2013%.3f | chunk %d,%d]",
                 snapshot.seasonKey(), coldEdge, warmEdge,
-                playerChunk.x, playerChunk.z)), false);
+                playerChunk.x(), playerChunk.z())), false);
 
-        BlockPos.Mutable surfacePos = new BlockPos.Mutable();
-        BlockPos.Mutable abovePos   = new BlockPos.Mutable();
+        BlockPos.MutableBlockPos surfacePos = new BlockPos.MutableBlockPos();
+        BlockPos.MutableBlockPos abovePos   = new BlockPos.MutableBlockPos();
 
         for (int dz = -1; dz <= 1; dz++) {
             for (int dx = -1; dx <= 1; dx++) {
-                ChunkPos chunkPos = new ChunkPos(playerChunk.x + dx, playerChunk.z + dz);
+                ChunkPos chunkPos = new ChunkPos(playerChunk.x() + dx, playerChunk.z() + dz);
 
                 float minTemp  =  Float.MAX_VALUE;
                 float maxTemp  = -Float.MAX_VALUE;
@@ -193,22 +193,22 @@ public final class SeasonCacheCommands {
 
                 for (int lz = 0; lz < 16; lz++) {
                     for (int lx = 0; lx < 16; lx++) {
-                        int worldX = chunkPos.getStartX() + lx;
-                        int worldZ = chunkPos.getStartZ() + lz;
-                        int topY   = world.getTopY(Heightmap.Type.MOTION_BLOCKING_NO_LEAVES,
+                        int worldX = chunkPos.getMinBlockX() + lx;
+                        int worldZ = chunkPos.getMinBlockZ() + lz;
+                        int topY   = world.getHeight(Heightmap.Types.MOTION_BLOCKING_NO_LEAVES,
                                                    worldX, worldZ) - 1;
 
-                        if (topY < world.getBottomY()) continue;
+                        if (topY < world.getMinY()) continue;
 
                         surfacePos.set(worldX, topY,     worldZ);
                         abovePos.set(  worldX, topY + 1, worldZ);
 
-                        if (!world.isSkyVisible(abovePos)) continue;
+                        if (!world.canSeeSkyFromBelowWater(abovePos)) continue;
 
-                        RegistryEntry<Biome> biomeEntry = world.getBiome(surfacePos);
+                        Holder<Biome> biomeEntry = world.getBiome(surfacePos);
                         if (!biomeEntry.value().hasPrecipitation()) continue;
 
-                        float t = SeasonHooks.getBiomeTemperature(world, biomeEntry, surfacePos);
+                        float t = SeasonHooks.getBiomeTemperature(world, biomeEntry, surfacePos, world.getSeaLevel());
 
                         if (t < minTemp) minTemp = t;
                         if (t > maxTemp) maxTemp = t;
@@ -223,7 +223,7 @@ public final class SeasonCacheCommands {
 
                 final int fdx = dx, fdz = dz;
                 if (scanned == 0) {
-                    source.sendFeedback(() -> Text.literal(
+                    source.sendSuccess(() -> Component.literal(
                             String.format("(%+d,%+d) no sky-visible precipitating columns", fdx, fdz)
                     ), false);
                     continue;
@@ -234,7 +234,7 @@ public final class SeasonCacheCommands {
                 final float fMean = (float)(sumTemp / scanned);
                 final int fN = scanned, fCold = coldCount, fBand = bandCount, fWarm = warmCount;
 
-                source.sendFeedback(() -> Text.literal(String.format(
+                source.sendSuccess(() -> Component.literal(String.format(
                         "(%+d,%+d) n=%-3d mean=%.3f min=%.3f max=%.3f | cold=%-3d band=%-3d warm=%d",
                         fdx, fdz, fN, fMean, fMin, fMax, fCold, fBand, fWarm
                 )), false);
@@ -268,9 +268,9 @@ public final class SeasonCacheCommands {
      *   snowy=false but snow visible → reconciler ran but applyChunkTruth missed it
      *                                  (e.g. surface Y was wrong, chunk was loaded mid-build)
      */
-    private static int runDebugState(ServerCommandSource source) {
+    private static int runDebugState(CommandSourceStack source) {
         SeasonCacheMod mod = SeasonCacheMod.get();
-        ServerWorld world = source.getWorld();
+        ServerLevel world = source.getLevel();
 
         int currentEpoch = mod.epochService().currentEpoch(world);
         RuntimeTypes.SeasonSnapshot snapshot = mod.seasonProvider().snapshot(world);
@@ -285,17 +285,17 @@ public final class SeasonCacheCommands {
             seasonHeader.append(orderedKeys.get(i)).append("(").append(i).append(")");
         }
 
-        ChunkPos playerChunk = new ChunkPos(BlockPos.ofFloored(source.getPosition()));
+        ChunkPos playerChunk = ChunkPos.containing(BlockPos.containing(source.getPosition()));
 
-        source.sendFeedback(() -> Text.literal(String.format(
+        source.sendSuccess(() -> Component.literal(String.format(
                 "[SC DebugState | %s | idx=%d | epoch=%08x]",
                 snapshot.seasonKey(), currentSeasonIndex, currentEpoch
         )), false);
-        source.sendFeedback(() -> Text.literal(seasonHeader.toString()), false);
+        source.sendSuccess(() -> Component.literal(seasonHeader.toString()), false);
 
         for (int dz = -1; dz <= 1; dz++) {
             for (int dx = -1; dx <= 1; dx++) {
-                ChunkPos chunkPos = new ChunkPos(playerChunk.x + dx, playerChunk.z + dz);
+                ChunkPos chunkPos = new ChunkPos(playerChunk.x() + dx, playerChunk.z() + dz);
 
                 RuntimeTypes.StaticChunkClimate climate =
                         mod.store().getStaticClimateSample(world, chunkPos);
@@ -307,7 +307,7 @@ public final class SeasonCacheCommands {
                 final int fdx = dx, fdz = dz;
 
                 if (climate == null && rule == null) {
-                    source.sendFeedback(() -> Text.literal(String.format(
+                    source.sendSuccess(() -> Component.literal(String.format(
                             "(%+d,%+d) [NO CACHE] chunk not yet processed",
                             fdx, fdz
                     )), false);
@@ -346,7 +346,7 @@ public final class SeasonCacheCommands {
                 String stateStr = String.format("clean=%-5b now=%s",
                         clean, snowy == null ? "?" : (snowy ? "SNOWY" : "clear"));
 
-                source.sendFeedback(() -> Text.literal(String.format(
+                source.sendSuccess(() -> Component.literal(String.format(
                         "(%+d,%+d) %s | %s | %s",
                         fdx, fdz, climateStr, ruleStr, stateStr
                 )), false);
@@ -354,7 +354,7 @@ public final class SeasonCacheCommands {
                 // If snowy seasons is long, print it on a second line to keep lines readable
                 if (rule != null && snowySeasons.length() > 60) {
                     final String fs = snowySeasons;
-                    source.sendFeedback(() -> Text.literal(
+                    source.sendSuccess(() -> Component.literal(
                             "         snowy in: " + fs
                     ), false);
                 }
@@ -364,10 +364,10 @@ public final class SeasonCacheCommands {
         return 1;
     }
 
-    private static int runSweep(ServerCommandSource source) {
+    private static int runSweep(CommandSourceStack source) {
         SeasonCacheMod mod = SeasonCacheMod.get();
         mod.forceSweepLoadedChunks(source.getServer());
-        source.sendFeedback(() -> Text.literal(
+        source.sendSuccess(() -> Component.literal(
                 "Season Cache: force sweep queued. All loaded chunks will be re-reconciled. Watch coverageBuild= in /seasoncache status."
         ), true);
         return 1;

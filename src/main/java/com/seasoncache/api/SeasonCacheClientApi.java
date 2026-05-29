@@ -1,8 +1,8 @@
 package com.seasoncache.api;
 
 import com.seasoncache.client.SeasonCacheClientState;
-import net.minecraft.registry.RegistryKey;
-import net.minecraft.world.World;
+import net.minecraft.resources.ResourceKey;
+import net.minecraft.world.level.Level;
 
 import java.util.List;
 
@@ -22,11 +22,11 @@ public final class SeasonCacheClientApi {
         return SeasonCacheClientState.isAuthoritativeSessionActive();
     }
 
-    public static boolean isSnapshotInProgress(RegistryKey<World> dimension) {
+    public static boolean isSnapshotInProgress(ResourceKey<Level> dimension) {
         return SeasonCacheClientState.isSnapshotInProgress(dimension);
     }
 
-    public static Integer currentEpoch(RegistryKey<World> dimension) {
+    public static Integer currentEpoch(ResourceKey<Level> dimension) {
         return SeasonCacheClientState.currentEpoch(dimension);
     }
 
@@ -34,7 +34,7 @@ public final class SeasonCacheClientApi {
      * @return Boolean.TRUE / Boolean.FALSE when authoritative data exists for the chunk,
      *         or null when the server has not provided a value for it yet.
      */
-    public static Boolean getChunkSnowState(RegistryKey<World> dimension, int chunkX, int chunkZ) {
+    public static Boolean getChunkSnowState(ResourceKey<Level> dimension, int chunkX, int chunkZ) {
         return SeasonCacheClientState.getChunkSnowState(dimension, chunkX, chunkZ);
     }
 
@@ -53,17 +53,17 @@ public final class SeasonCacheClientApi {
 
     public record ClientSnowEvent(
             ClientSnowEventType type,
-            RegistryKey<World> dimension,
+            ResourceKey<Level> dimension,
             int epoch,
             int chunkX,
             int chunkZ,
             boolean snowy
     ) {
-        public static ClientSnowEvent reset(RegistryKey<World> dimension, int epoch) {
+        public static ClientSnowEvent reset(ResourceKey<Level> dimension, int epoch) {
             return new ClientSnowEvent(ClientSnowEventType.RESET, dimension, epoch, 0, 0, false);
         }
 
-        public static ClientSnowEvent chunkState(RegistryKey<World> dimension, int epoch, int chunkX, int chunkZ, boolean snowy) {
+        public static ClientSnowEvent chunkState(ResourceKey<Level> dimension, int epoch, int chunkX, int chunkZ, boolean snowy) {
             return new ClientSnowEvent(ClientSnowEventType.CHUNK_STATE, dimension, epoch, chunkX, chunkZ, snowy);
         }
     }

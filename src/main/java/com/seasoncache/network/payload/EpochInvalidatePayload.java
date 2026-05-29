@@ -1,26 +1,28 @@
 package com.seasoncache.network.payload;
 
 import com.seasoncache.SeasonCacheMod;
-import net.minecraft.network.PacketByteBuf;
-import net.minecraft.network.codec.PacketCodec;
-import net.minecraft.network.packet.CustomPayload;
-import net.minecraft.util.Identifier;
+import net.minecraft.network.FriendlyByteBuf;
+import net.minecraft.network.codec.StreamCodec;
+import net.minecraft.network.protocol.common.custom.CustomPacketPayload;
+import net.minecraft.resources.Identifier;
 
-public record EpochInvalidatePayload(Identifier dimensionId, int epoch) implements CustomPayload {
-    public static final CustomPayload.Id<EpochInvalidatePayload> ID = new CustomPayload.Id<>(Identifier.of(SeasonCacheMod.MOD_ID, "epoch_invalidate"));
-    public static final PacketCodec<PacketByteBuf, EpochInvalidatePayload> CODEC = CustomPayload.codecOf(EpochInvalidatePayload::write, EpochInvalidatePayload::new);
+public record EpochInvalidatePayload(Identifier dimensionId, int epoch) implements CustomPacketPayload {
+    public static final StreamCodec<FriendlyByteBuf, EpochInvalidatePayload> STREAM_CODEC =
+            CustomPacketPayload.codec(EpochInvalidatePayload::write, EpochInvalidatePayload::new);
+    public static final CustomPacketPayload.Type<EpochInvalidatePayload> TYPE =
+            new CustomPacketPayload.Type<>(Identifier.fromNamespaceAndPath(SeasonCacheMod.MOD_ID, "epoch_invalidate"));
 
-    public EpochInvalidatePayload(PacketByteBuf buf) {
+    public EpochInvalidatePayload(FriendlyByteBuf buf) {
         this(buf.readIdentifier(), buf.readVarInt());
     }
 
-    private void write(PacketByteBuf buf) {
+    private void write(FriendlyByteBuf buf) {
         buf.writeIdentifier(this.dimensionId);
         buf.writeVarInt(this.epoch);
     }
 
     @Override
-    public CustomPayload.Id<? extends CustomPayload> getId() {
-        return ID;
+    public Type<EpochInvalidatePayload> type() {
+        return TYPE;
     }
 }

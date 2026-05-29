@@ -20,10 +20,10 @@ public final class SeasonCacheNetworking {
             return;
         }
 
-        PayloadTypeRegistry.playS2C().register(SnapshotBeginPayload.ID, SnapshotBeginPayload.CODEC);
-        PayloadTypeRegistry.playS2C().register(ChunkStatesPayload.ID, ChunkStatesPayload.CODEC);
-        PayloadTypeRegistry.playS2C().register(SnapshotEndPayload.ID, SnapshotEndPayload.CODEC);
-        PayloadTypeRegistry.playS2C().register(EpochInvalidatePayload.ID, EpochInvalidatePayload.CODEC);
+        PayloadTypeRegistry.clientboundPlay().register(SnapshotBeginPayload.TYPE, SnapshotBeginPayload.STREAM_CODEC);
+        PayloadTypeRegistry.clientboundPlay().register(ChunkStatesPayload.TYPE, ChunkStatesPayload.STREAM_CODEC);
+        PayloadTypeRegistry.clientboundPlay().register(SnapshotEndPayload.TYPE, SnapshotEndPayload.STREAM_CODEC);
+        PayloadTypeRegistry.clientboundPlay().register(EpochInvalidatePayload.TYPE, EpochInvalidatePayload.STREAM_CODEC);
 
         SeasonCacheMod.LOGGER.info("Season Cache networking registered.");
     }

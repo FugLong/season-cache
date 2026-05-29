@@ -1,11 +1,11 @@
 package com.seasoncache.integration;
 
 import com.seasoncache.core.RuntimeTypes;
-import net.minecraft.registry.entry.RegistryEntry;
-import net.minecraft.server.world.ServerWorld;
-import net.minecraft.util.Identifier;
-import net.minecraft.util.math.BlockPos;
-import net.minecraft.world.biome.Biome;
+import net.minecraft.core.Holder;
+import net.minecraft.server.level.ServerLevel;
+import net.minecraft.resources.Identifier;
+import net.minecraft.core.BlockPos;
+import net.minecraft.world.level.biome.Biome;
 
 import java.util.Set;
 
@@ -27,7 +27,7 @@ public interface SeasonProvider {
      * The snapshot's seasonKey is the SS sub-season serialized name,
      * e.g. "early_spring", "mid_winter", "late_summer".
      */
-    RuntimeTypes.SeasonSnapshot snapshot(ServerWorld world);
+    RuntimeTypes.SeasonSnapshot snapshot(ServerLevel world);
 
     /**
      * Builds the set of biome registry keys that are classified as perennially
@@ -39,11 +39,11 @@ public interface SeasonProvider {
      * biomes like Snowy Taiga from PERENNIAL_COLD to SEASONAL_TEMPORARY
      * without any per-tick SS queries.
      *
-     * @param world any loaded ServerWorld (used for SS context, not position-specific)
+     * @param world any loaded ServerLevel (used for SS context, not position-specific)
      * @param allBiomes all registered biomes to scan
      */
-    Set<Identifier> buildSeasonalOverrideSet(ServerWorld world,
-            Iterable<? extends RegistryEntry<Biome>> allBiomes);
+    Set<Identifier> buildSeasonalOverrideSet(ServerLevel world,
+            Iterable<? extends Holder<Biome>> allBiomes);
 
     /**
      * Tier 1 biome gate. Fast — no SS climate query.
@@ -52,14 +52,14 @@ public interface SeasonProvider {
      *
      * @param seasonalColdOverrides set built by {@link #buildSeasonalOverrideSet}
      */
-    RuntimeTypes.ColumnType classifyColumn(ServerWorld world, BlockPos pos,
-            RegistryEntry<Biome> biome, Set<Identifier> seasonalColdOverrides);
+    RuntimeTypes.ColumnType classifyColumn(ServerLevel world, BlockPos pos,
+            Holder<Biome> biome, Set<Identifier> seasonalColdOverrides);
 
     /**
      * Returns true if the current SS sub-season is a winter variant.
      * Called once per chunk reconcile pass, not per column.
      */
-    boolean isSnowSeason(ServerWorld world);
+    boolean isSnowSeason(ServerLevel world);
 
     /**
      * Returns true if transitioning into the given sub-season requires the
@@ -83,8 +83,8 @@ public interface SeasonProvider {
      * Returns the seasonally adjusted temperature SS would use for the supplied
      * biome/position right now. Used only when building persistent chunk rules.
      */
-    float sampleSeasonalTemperature(ServerWorld world, BlockPos pos,
-            RegistryEntry<Biome> biome);
+    float sampleSeasonalTemperature(ServerLevel world, BlockPos pos,
+            Holder<Biome> biome);
 
     /**
      * Tier 2 snow decision. Uses SS's season-aware temperature to compute a
@@ -104,14 +104,14 @@ public interface SeasonProvider {
      * @param epoch        current season epoch, used as part of the noise seed
      * @param bandWidth    hysteresis half-width from config
      */
-    boolean shouldHaveSnowNow(ServerWorld world, BlockPos pos,
-            RegistryEntry<Biome> biome, boolean isSnowSeason, int epoch, float bandWidth);
+    boolean shouldHaveSnowNow(ServerLevel world, BlockPos pos,
+            Holder<Biome> biome, boolean isSnowSeason, int epoch, float bandWidth);
 
     /**
      * Tier 2 ice decision. Mirrors shouldHaveSnowNow including the non-winter
      * fast path. Spatial restriction to shoreline-adjacent cells is enforced by
      * the reconciler, not here.
      */
-    boolean shouldHaveIceNow(ServerWorld world, BlockPos pos,
-            RegistryEntry<Biome> biome, boolean isSnowSeason, int epoch, float bandWidth);
+    boolean shouldHaveIceNow(ServerLevel world, BlockPos pos,
+            Holder<Biome> biome, boolean isSnowSeason, int epoch, float bandWidth);
 }
